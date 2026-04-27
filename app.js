@@ -1,5 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js";
 import { getFirestore, doc, onSnapshot, setDoc } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js";
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-storage.js";
 
 // ---------------------------------------------------------------------------
 // Firebase setup — skipped gracefully if config is missing or incomplete
@@ -16,12 +17,14 @@ if (window.FIREBASE_CONFIG) {
 }
 
 let db = null;
+let storage = null;
 let unsubscribe = null;
 
 if (firebaseReady) {
   try {
     const app = initializeApp(cfg);
     db = getFirestore(app);
+    storage = getStorage(app);
     console.log("[Firebase] initialized OK");
   } catch (e) {
     console.error("[Firebase] init error:", e);
@@ -43,7 +46,8 @@ const ROOMS_DEFAULT = [
 
 let state = { rooms: [], activeRoom: null };
 let modalCb = null;
-let ignoreNextRemoteUpdate = false;
+let roomSortable = null;
+let matSortable = null;
 
 function uid() { return Math.random().toString(36).slice(2, 10); }
 function getRoom(id) { return state.rooms.find(r => r.id === id); }
@@ -56,11 +60,16 @@ const LOCAL_KEY = 'remont_v2';
 const FIRESTORE_DOC = 'shared/state';
 
 function stateForStorage() {
-  // Strip base64 images — too large for Firestore (1 MB doc limit).
-  // Images stay local only.
   return {
     activeRoom: state.activeRoom,
-    rooms: state.rooms.map(r => ({ ...r, images: [] }))
+    rooms: state.rooms.map(r => ({
+      ...r,
+      images: r.images.map(img => ({
+        name: img.name,
+        url: img.url,
+        path: img.path // Path in Firebase Storage to allow deletion
+      }))
+    }))
   };
 }
 
@@ -101,10 +110,9 @@ function init() {
       if (snapshot.metadata.hasPendingWrites) return;
       if (snapshot.exists()) {
         const remote = snapshot.data();
-        // Merge: keep active room from remote, restore local images
         state.rooms = remote.rooms || [];
         state.activeRoom = remote.activeRoom || (state.rooms[0]?.id ?? null);
-        loadLocalImages();
+        // We no longer call loadLocalImages() because images are now remote
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
       } else {
         // First time — push local state to Firestore
@@ -160,10 +168,25 @@ function renderSidebar() {
     const total = r.materials.length, done = r.materials.filter(m => m.done).length;
     const cls = total === 0 ? 'empty' : done === total ? 'done' : 'partial';
     const active = r.id === state.activeRoom ? 'active' : '';
-    return `<div class="room-item ${active}" onclick="selectRoom('${r.id}')">
+    return `<div class="room-item ${active}" data-id="${r.id}" onclick="selectRoom('${r.id}')">
       <div class="room-dot ${cls}"></div><span>${escHtml(r.name)}</span>
     </div>`;
   }).join('');
+  initRoomSortable();
+}
+
+function initRoomSortable() {
+  const el = document.getElementById('room-list');
+  if (roomSortable) roomSortable.destroy();
+  roomSortable = Sortable.create(el, {
+    animation: 150,
+    ghostClass: 'sortable-ghost',
+    onEnd: (evt) => {
+      const moved = state.rooms.splice(evt.oldIndex, 1)[0];
+      state.rooms.splice(evt.newIndex, 0, moved);
+      save(true);
+    }
+  });
 }
 
 function renderContent() {
@@ -174,13 +197,13 @@ function renderContent() {
   const pct = total ? Math.round(done / total * 100) : 0;
 
   const imgGrid = room.images.map((img, i) => `
-    <div class="img-thumb">
-      <img src="${img.data}" alt="wizualizacja">
-      <button class="img-del" onclick="delImg('${room.id}',${i})">✕</button>
+    <div class="img-thumb" onclick="openImage('${img.url || img.data}')">
+      <img src="${img.url || img.data}" alt="wizualizacja">
+      <button class="img-del" onclick="event.stopPropagation();delImg('${room.id}',${i})">✕</button>
     </div>`).join('');
 
   const matRows = room.materials.map((m, i) => `
-    <div class="mat-row ${m.done ? 'done-row' : ''}">
+    <div class="mat-row ${m.done ? 'done-row' : ''}" data-idx="${i}">
       <input type="checkbox" class="mat-check" ${m.done ? 'checked' : ''} onchange="toggleMat('${room.id}',${i})">
       <div class="mat-name" contenteditable="true" onblur="editMat('${room.id}',${i},'name',this.innerText)">${escHtml(m.name)}</div>
       <div class="mat-qty">
@@ -200,12 +223,6 @@ function renderContent() {
         ${m.link ? `<br><a href="${escHtml(m.link)}" target="_blank" rel="noopener">↗ otwórz</a>` : ''}
       </div>
       <div class="mat-del"><button onclick="delMat('${room.id}',${i})" title="Usuń">×</button></div>
-      <div style="display:flex;flex-direction:column;gap:1px">
-        <button onclick="moveMat('${room.id}',${i},-1)" ${i === 0 ? 'disabled' : ''} title="W górę"
-          style="background:none;border:none;cursor:pointer;color:${i === 0 ? '#ddd' : '#888'};font-size:11px;padding:1px 3px">▲</button>
-        <button onclick="moveMat('${room.id}',${i},1)" ${i === room.materials.length - 1 ? 'disabled' : ''} title="W dół"
-          style="background:none;border:none;cursor:pointer;color:${i === room.materials.length - 1 ? '#ddd' : '#888'};font-size:11px;padding:1px 3px">▼</button>
-      </div>
     </div>`).join('');
 
   el.innerHTML = `
@@ -227,7 +244,7 @@ function renderContent() {
       <div class="sum-card"><div class="sum-label">Do kupienia</div><div class="sum-val" style="color:#BA7517">${total - done}</div></div>
       <div class="sum-card"><div class="sum-label">Postęp</div><div class="sum-val">${pct}%</div></div>
     </div>
-    ${room.images.length ? `<div class="img-section"><div class="img-label">Wizualizacje / inspiracje (tylko lokalnie)</div><div class="img-grid">${imgGrid}</div></div>` : ''}
+    ${room.images.length ? `<div class="img-section"><div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div></div>` : ''}
     <div class="materials-section">
       <div class="mat-header">
         <div style="width:16px"></div>
@@ -237,7 +254,9 @@ function renderContent() {
         <div style="width:140px">Link</div>
         <div style="width:56px"></div>
       </div>
-      ${matRows || `<div style="padding:1.5rem;text-align:center;color:#aaa;font-size:13px">Brak materiałów — dodaj poniżej</div>`}
+      <div id="mat-list">
+        ${matRows || `<div style="padding:1.5rem;text-align:center;color:#aaa;font-size:13px">Brak materiałów — dodaj poniżej</div>`}
+      </div>
       <div class="add-mat-row">
         <input class="in-name" id="in-name" placeholder="Nazwa materiału..."
           onkeydown="if(event.key==='Enter')addMat('${room.id}')">
@@ -247,6 +266,24 @@ function renderContent() {
         <button class="btn primary" onclick="addMat('${room.id}')">Dodaj</button>
       </div>
     </div>`;
+  initMatSortable(room.id);
+}
+
+function initMatSortable(roomId) {
+  const el = document.getElementById('mat-list');
+  if (matSortable) matSortable.destroy();
+  if (!el || el.children.length <= 1 && el.innerText.includes('Brak')) return;
+  matSortable = Sortable.create(el, {
+    animation: 150,
+    ghostClass: 'sortable-ghost',
+    onEnd: (evt) => {
+      const room = getRoom(roomId);
+      const moved = room.materials.splice(evt.oldIndex, 1)[0];
+      room.materials.splice(evt.newIndex, 0, moved);
+      save(true);
+      render(false); // Update indices and UI
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -293,25 +330,65 @@ window.editMat = function(roomId, idx, field, val) {
   render(true);
 };
 
-window.moveMat = function(roomId, idx, dir) {
-  const r = getRoom(roomId), to = idx + dir;
-  if (to < 0 || to >= r.materials.length) return;
-  [r.materials[idx], r.materials[to]] = [r.materials[to], r.materials[idx]];
-  render();
-};
-
 window.delMat = function(roomId, idx) { getRoom(roomId).materials.splice(idx, 1); render(); };
 
 window.addImages = function(roomId, evt) {
+  if (!storage) {
+    alert("Cloud Storage nie jest skonfigurowany. Zdjęcia pozostaną tylko lokalnie.");
+    // Fallback to local only if storage is missing
+    const r = getRoom(roomId);
+    [...evt.target.files].forEach(f => {
+      const fr = new FileReader();
+      fr.onload = e => { r.images.push({ data: e.target.result, name: f.name }); render(); };
+      fr.readAsDataURL(f);
+    });
+    return;
+  }
+
   const r = getRoom(roomId);
-  [...evt.target.files].forEach(f => {
-    const fr = new FileReader();
-    fr.onload = e => { r.images.push({ data: e.target.result, name: f.name }); render(); };
-    fr.readAsDataURL(f);
+  setBanner("sync", "Przesyłanie zdjęć…");
+  
+  const uploads = [...evt.target.files].map(async f => {
+    const path = `rooms/${roomId}/${uid()}_${f.name}`;
+    const storageRef = ref(storage, path);
+    try {
+      const snapshot = await uploadBytes(storageRef, f);
+      const url = await getDownloadURL(snapshot.ref);
+      r.images.push({ url, path, name: f.name });
+    } catch (err) {
+      console.error("Upload failed:", err);
+      setBanner("error", "Błąd przesyłania: " + err.message);
+    }
+  });
+
+  Promise.all(uploads).then(() => {
+    setBanner("sync", "Zdjęcia przesłane", 2000);
+    render(true);
   });
 };
 
-window.delImg = function(roomId, idx) { getRoom(roomId).images.splice(idx, 1); render(); };
+window.delImg = function(roomId, idx) {
+  const r = getRoom(roomId);
+  const img = r.images[idx];
+  
+  if (img.path && storage) {
+    const storageRef = ref(storage, img.path);
+    deleteObject(storageRef).catch(err => {
+      console.warn("Could not delete file from storage:", err);
+    });
+  }
+  
+  r.images.splice(idx, 1);
+  render(true);
+};
+
+window.openImage = function(url) {
+  const overlay = document.createElement('div');
+  overlay.className = 'img-overlay';
+  overlay.innerHTML = `<img src="${url}" alt="enlarged">`;
+  overlay.onclick = () => document.body.removeChild(overlay);
+  document.body.appendChild(overlay);
+};
 
 window.exportJSON = function() {
   const json = JSON.stringify(state, null, 2);
@@ -340,11 +417,11 @@ window.openShareModal = function() {
   showModal('Udostępnij listę', () => `
     <p style="font-size:13px;color:#555;margin-bottom:12px">
       ${db
-        ? 'Synchronizacja przez Firestore jest aktywna — wszystkie osoby z dostępem do strony widzą te same dane w czasie rzeczywistym.'
+        ? 'Synchronizacja przez Firestore jest aktywna — wszystkie osoby z dostępem do strony widzą te same dane i zdjęcia w czasie rzeczywistym.'
         : 'Firestore nie jest skonfigurowany — dane są przechowywane lokalnie w przeglądarce.'}
     </p>
     <p style="font-size:13px;color:#555;margin-bottom:12px">
-      Możesz też wyeksportować dane do pliku JSON i wysłać go drugiej osobie — zaimportuje go przyciskiem "Importuj JSON".
+      Zdjęcia są przechowywane w Firebase Cloud Storage i dostępne dla każdego współdzielącego listę.
     </p>
   `, null, false);
 };

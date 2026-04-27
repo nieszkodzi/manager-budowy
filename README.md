@@ -2,7 +2,7 @@
 
 A web app for tracking renovation materials room by room. Supports real-time sync via Firebase Firestore so everyone with access to the page sees the same data live. Falls back to local-only mode if Firebase is not configured.
 
-## Features
+## Featureshow can I add more storage 
 
 - List materials per room with quantity, unit, and a link to the product
 - Check off items as you buy them and track progress per room
