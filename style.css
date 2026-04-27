@@ -44,10 +44,10 @@ header{background:#fff;border-bottom:0.5px solid #ddd;padding:1rem 2rem;display:
 .mat-header{display:flex;font-size:12px;color:#888;padding:8px 14px;border-bottom:0.5px solid #eee;background:#fafaf8;gap:8px}
 .mat-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:0.5px solid #f0f0ec;font-size:13.5px;transition:background 0.1s;cursor:default;flex-wrap:wrap}
 .mat-name-cell{flex:2;min-width:0;display:flex;flex-direction:column;gap:4px}
-.mat-notes{width:100%;font-size:12px;color:#666;border:none;background:transparent;resize:vertical;min-height:20px;padding:2px 0;outline:none;border-bottom:1px dashed transparent}
+.mat-notes{width:100%;font-size:12px;color:#666;border:none;background:transparent;resize:none;min-height:20px;padding:2px 0;outline:none;border-bottom:1px dashed transparent;overflow:hidden}
 .mat-notes:focus{border-bottom-color:#ddd}
 .room-notes-section{margin-bottom:1.5rem}
-.room-notes{width:100%;min-height:60px;padding:10px;border-radius:8px;border:0.5px solid #ddd;font-size:13px;font-family:inherit;resize:vertical;outline:none}
+.room-notes{width:100%;min-height:60px;padding:10px;border-radius:8px;border:0.5px solid #ddd;font-size:13px;font-family:inherit;resize:none;outline:none;overflow:hidden}
 .room-notes:focus{border-color:#ccc}
 .mat-name:focus{border-bottom:1px solid #ccc}
 .mat-qty{width:70px;text-align:center;font-size:13px}

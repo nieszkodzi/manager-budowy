@@ -235,6 +235,12 @@ function initRoomSortable() {
 let isEditing = false;
 function setEditing(val) { isEditing = val; }
 
+function autoResize(el) {
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = el.scrollHeight + 'px';
+}
+
 function renderContent() {
   const el = document.getElementById('content');
   const room = getRoom(state.activeRoom);
@@ -261,7 +267,10 @@ function renderContent() {
       <input type="checkbox" class="mat-check" ${m.done ? 'checked' : ''} onchange="toggleMat('${room.id}',${i})">
       <div class="mat-name-cell">
         <div class="mat-name" contenteditable="true" onfocus="setEditing(true)" onblur="setEditing(false);editMat('${room.id}',${i},'name',this.innerText)">${escHtml(m.name)}</div>
-        <textarea class="mat-notes" placeholder="Notatki..." onfocus="setEditing(true)" onblur="setEditing(false);editMat('${room.id}',${i},'notes',this.value)">${escHtml(m.notes || '')}</textarea>
+        <textarea class="mat-notes" placeholder="Notatki..." 
+          onfocus="setEditing(true)" 
+          oninput="autoResize(this)"
+          onblur="setEditing(false);editMat('${room.id}',${i},'notes',this.value)">${escHtml(m.notes || '')}</textarea>
       </div>
       <div class="mat-qty">
         <input type="number" value="${m.qty}" min="0" step="0.1"
@@ -296,7 +305,10 @@ function renderContent() {
       </div>
     </div>
     <div class="room-notes-section">
-      <textarea class="room-notes" placeholder="Notatki do pomieszczenia..." onfocus="setEditing(true)" onblur="setEditing(false);renameRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
+      <textarea class="room-notes" placeholder="Notatki do pomieszczenia..." 
+        onfocus="setEditing(true)" 
+        oninput="autoResize(this)"
+        onblur="setEditing(false);renameRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
     </div>
     <div class="summary-bar">
       <div class="sum-card"><div class="sum-label">Wszystkich pozycji</div><div class="sum-val">${total}</div></div>
@@ -332,6 +344,9 @@ function renderContent() {
       </div>
     </div>`;
   initMatSortable(room.id);
+  
+  // Auto-resize all textareas after render
+  el.querySelectorAll('textarea').forEach(autoResize);
 }
 
 function initMatSortable(roomId) {
@@ -419,7 +434,13 @@ window.editMat = function(roomId, idx, field, val) {
   render(true);
 };
 
-window.delMat = function(roomId, idx) { getRoom(roomId).materials.splice(idx, 1); render(); };
+window.delMat = function(roomId, idx) {
+  const r = getRoom(roomId);
+  const m = r.materials[idx];
+  if (!confirm(`Czy na pewno chcesz usunąć materiał: "${m.name}"?`)) return;
+  r.materials.splice(idx, 1);
+  render();
+};
 
 window.addImages = function(roomId, evt) {
   if (!storage) {
@@ -487,6 +508,7 @@ window.addImages = function(roomId, evt) {
 };
 
 window.delImg = function(roomId, idx) {
+  if (!confirm('Czy na pewno chcesz usunąć to zdjęcie?')) return;
   const r = getRoom(roomId);
   const img = r.images[idx];
   
