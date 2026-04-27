@@ -40,7 +40,7 @@ header{background:#fff;border-bottom:0.5px solid #ddd;padding:1rem 2rem;display:
 .img-thumb:hover .img-del{display:block}
 .materials-section{background:#fff;border-radius:12px;border:0.5px solid #ddd;overflow:hidden;margin-bottom:2rem}
 .mat-header{display:flex;font-size:12px;color:#888;padding:8px 14px;border-bottom:0.5px solid #eee;background:#fafaf8;gap:8px}
-.mat-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:0.5px solid #f0f0ec;font-size:13.5px;transition:background 0.1s;cursor:grab}
+.mat-row{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:0.5px solid #f0f0ec;font-size:13.5px;transition:background 0.1s;cursor:grab;flex-wrap:wrap}
 .mat-row:active{cursor:grabbing}
 .mat-row:last-child{border-bottom:none}
 .mat-row:hover{background:#fafaf8}
@@ -83,10 +83,44 @@ input[type=file]{display:none}
 .img-overlay img{max-width:100%;max-height:100%;object-fit:contain;border-radius:4px;box-shadow:0 0 20px rgba(0,0,0,0.5)}
 
 @media(max-width:700px){
-  .sidebar{width:160px}
+  header{padding:0.5rem 1rem}
+  #menu-toggle{display:block!important}
+  .sidebar{
+    position:fixed;
+    left:-220px;
+    width:220px;
+    top:57px;
+    bottom:0;
+    z-index:150;
+    transition:left 0.3s;
+    box-shadow:2px 0 10px rgba(0,0,0,0.1);
+  }
+  .sidebar.open{left:0}
+  .sidebar-overlay{
+    position:fixed;
+    inset:0;
+    background:rgba(0,0,0,0.3);
+    z-index:140;
+    display:none;
+  }
+  .sidebar-overlay.show{display:block}
   .content{padding:1rem}
   .room-title{font-size:1.2rem}
-  .mat-link{display:none}
+  .mat-header{display:none}
+  .mat-row{flex-direction:column;align-items:stretch;position:relative;padding-bottom:40px}
+  .mat-name{font-weight:600;width:100%;margin-bottom:8px}
+  .mat-qty, .mat-unit, .mat-link{width:100%!important;text-align:left!important;display:flex;align-items:center;gap:8px}
+  .mat-qty::before{content:'Ilość:';font-size:11px;color:#888;width:60px}
+  .mat-unit::before{content:'Jedn:';font-size:11px;color:#888;width:60px}
+  .mat-link::before{content:'Link:';font-size:11px;color:#888;width:60px}
+  .mat-link br{display:none}
+  .mat-del{position:absolute;bottom:8px;right:14px;width:auto}
+  .mat-check{position:absolute;top:10px;right:14px}
+  .add-mat-row{flex-direction:column;align-items:stretch}
+  .add-mat-row input{width:100%!important}
+  .summary-bar{gap:8px}
+  .sum-card{padding:8px;min-width:80px}
+  .sum-val{font-size:1.1rem}
 }
 
 @media print{

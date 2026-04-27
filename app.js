@@ -323,7 +323,21 @@ function initMatSortable(roomId) {
 
 function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
-window.selectRoom = function(id) { state.activeRoom = id; render(); };
+window.selectRoom = function(id) { 
+  state.activeRoom = id; 
+  render();
+  window.toggleSidebar(false);
+};
+
+window.toggleSidebar = function(force) {
+  const sb = document.querySelector('.sidebar');
+  const overlay = document.querySelector('.sidebar-overlay');
+  if (sb) {
+    const isOpen = force !== undefined ? force : !sb.classList.contains('open');
+    sb.classList.toggle('open', isOpen);
+    overlay?.classList.toggle('show', isOpen);
+  }
+};
 
 window.renameRoom = function(id, name) {
   const r = getRoom(id); if (r && name.trim()) { r.name = name.trim(); render(true); }

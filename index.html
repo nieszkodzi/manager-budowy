@@ -9,6 +9,7 @@
 <body>
 
 <header>
+  <button id="menu-toggle" class="btn" onclick="toggleSidebar()" style="display:none;margin-right:8px">☰</button>
   <div class="logo">Remont domu</div>
   <div class="header-btns">
     <button class="btn share" onclick="openShareModal()">Udostępnij</button>
@@ -21,6 +22,7 @@
 </header>
 
 <div class="main">
+  <div class="sidebar-overlay" onclick="toggleSidebar()"></div>
   <div class="sidebar">
     <div class="sidebar-title">Pomieszczenia</div>
     <div id="room-list"></div>
