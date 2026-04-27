@@ -115,7 +115,18 @@ function init() {
       if (snapshot.exists()) {
         const remote = snapshot.data();
         console.log("[Firestore] data loaded:", remote.rooms?.length, "rooms");
-        state.rooms = remote.rooms || [];
+        
+        // Merge strategy: preserve local images if remote has none or we have newer ones
+        const remoteRooms = remote.rooms || [];
+        remoteRooms.forEach(rr => {
+          const lr = state.rooms.find(l => l.id === rr.id);
+          if (lr && lr.images?.length > (rr.images?.length || 0)) {
+            console.log(`[Firestore] preserving local images for room ${rr.id}`);
+            rr.images = lr.images;
+          }
+        });
+
+        state.rooms = remoteRooms;
         state.activeRoom = remote.activeRoom || (state.rooms[0]?.id ?? null);
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
       } else {
@@ -189,7 +200,11 @@ function renderSidebar() {
 
 function initRoomSortable() {
   const el = document.getElementById('room-list');
-  if (roomSortable) roomSortable.destroy();
+  if (!el) return;
+  if (roomSortable) {
+    try { roomSortable.destroy(); } catch (e) {}
+    roomSortable = null;
+  }
   roomSortable = Sortable.create(el, {
     animation: 150,
     ghostClass: 'sortable-ghost',
@@ -283,13 +298,17 @@ function renderContent() {
 
 function initMatSortable(roomId) {
   const el = document.getElementById('mat-list');
-  if (matSortable) matSortable.destroy();
-  if (!el || el.children.length <= 1 && el.innerText.includes('Brak')) return;
+  if (matSortable) {
+    try { matSortable.destroy(); } catch (e) {}
+    matSortable = null;
+  }
+  if (!el || (el.children.length <= 1 && el.innerText.includes('Brak'))) return;
   matSortable = Sortable.create(el, {
     animation: 150,
     ghostClass: 'sortable-ghost',
     onEnd: (evt) => {
       const room = getRoom(roomId);
+      if (!room) return;
       const moved = room.materials.splice(evt.oldIndex, 1)[0];
       room.materials.splice(evt.newIndex, 0, moved);
       save(true);
@@ -399,9 +418,11 @@ window.addImages = function(roomId, evt) {
 
   Promise.all(uploads).then(() => {
     if (successCount > 0) {
+      console.log(`[Storage] Finished ${successCount} uploads, saving state...`);
       setBanner("sync", failCount > 0 ? `Przesłano ${successCount}, błąd ${failCount}` : "Zdjęcia przesłane", 3000);
       render(true);
     } else if (failCount > 0) {
+      console.error(`[Storage] All uploads failed`);
       setBanner("error", "Nie udało się przesłać zdjęć");
     }
   });
