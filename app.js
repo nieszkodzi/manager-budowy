@@ -61,7 +61,6 @@ const FIRESTORE_DOC = 'shared/state';
 
 function stateForStorage() {
   return {
-    activeRoom: state.activeRoom,
     rooms: state.rooms.map(r => ({
       ...r,
       images: r.images.map(img => ({
@@ -114,20 +113,28 @@ function init() {
       }
       if (snapshot.exists()) {
         const remote = snapshot.data();
-        console.log("[Firestore] data loaded:", remote.rooms?.length, "rooms");
+        console.log("[Firestore] data received from remote");
         
-        // Merge strategy: preserve local images if remote has none or we have newer ones
+        // Merge strategy: preserve local data if we have pending changes or newer images
         const remoteRooms = remote.rooms || [];
         remoteRooms.forEach(rr => {
           const lr = state.rooms.find(l => l.id === rr.id);
-          if (lr && lr.images?.length > (rr.images?.length || 0)) {
+          if (!lr) return;
+
+          // 1. Preserve local images if they seem more complete
+          if (lr.images?.length > (rr.images?.length || 0)) {
             console.log(`[Firestore] preserving local images for room ${rr.id}`);
             rr.images = lr.images;
           }
+
+          // 2. If user is currently editing THIS room, we must be careful.
+          // For now, we allow the remote update but the UI won't re-render 
+          // the content area thanks to the isEditing check in renderContent.
+          // This allows the state to be updated in background without jumping the cursor.
         });
 
         state.rooms = remoteRooms;
-        state.activeRoom = remote.activeRoom || (state.rooms[0]?.id ?? null);
+        // Do not update state.activeRoom from remote to allow independent navigation
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
         setBanner("sync", "Zsynchronizowano", 2000);
       } else {
@@ -184,7 +191,11 @@ function setBanner(type, text, autoClearMs = 0) {
 // Render
 // ---------------------------------------------------------------------------
 
-function render(pushToFirestore = true) { renderSidebar(); renderContent(); save(pushToFirestore); }
+function render(pushToFirestore = true) { 
+  renderSidebar(); 
+  renderContent(); 
+  save(pushToFirestore); 
+}
 
 function renderSidebar() {
   const el = document.getElementById('room-list');
@@ -221,10 +232,20 @@ function initRoomSortable() {
   });
 }
 
+let isEditing = false;
+function setEditing(val) { isEditing = val; }
+
 function renderContent() {
   const el = document.getElementById('content');
   const room = getRoom(state.activeRoom);
   if (!room) { el.innerHTML = '<div class="empty-state">Wybierz pomieszczenie</div>'; return; }
+  
+  // If user is currently typing, don't re-render the content area to avoid losing focus/cursor position.
+  // We'll rely on the blur events to update the state and trigger a proper render if needed.
+  if (isEditing && document.activeElement && el.contains(document.activeElement)) {
+    console.log("[Render] skipping content render due to active editing");
+    return;
+  }
   const total = room.materials.length, done = room.materials.filter(m => m.done).length;
   const pct = total ? Math.round(done / total * 100) : 0;
 
@@ -239,23 +260,23 @@ function renderContent() {
       <div class="drag-handle">⋮⋮</div>
       <input type="checkbox" class="mat-check" ${m.done ? 'checked' : ''} onchange="toggleMat('${room.id}',${i})">
       <div class="mat-name-cell">
-        <div class="mat-name" contenteditable="true" onblur="editMat('${room.id}',${i},'name',this.innerText)">${escHtml(m.name)}</div>
-        <textarea class="mat-notes" placeholder="Notatki..." onblur="editMat('${room.id}',${i},'notes',this.value)">${escHtml(m.notes || '')}</textarea>
+        <div class="mat-name" contenteditable="true" onfocus="setEditing(true)" onblur="setEditing(false);editMat('${room.id}',${i},'name',this.innerText)">${escHtml(m.name)}</div>
+        <textarea class="mat-notes" placeholder="Notatki..." onfocus="setEditing(true)" onblur="setEditing(false);editMat('${room.id}',${i},'notes',this.value)">${escHtml(m.notes || '')}</textarea>
       </div>
       <div class="mat-qty">
         <input type="number" value="${m.qty}" min="0" step="0.1"
           style="width:60px;font-size:13px;padding:3px 6px;border-radius:6px;border:0.5px solid #ddd;text-align:center"
-          onchange="editMat('${room.id}',${i},'qty',this.value)">
+          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}',${i},'qty',this.value)">
       </div>
       <div class="mat-unit">
         <input type="text" value="${escHtml(m.unit || 'szt.')}"
           style="width:54px;font-size:12px;padding:3px 6px;border-radius:6px;border:0.5px solid #ddd;text-align:center;color:#888"
-          onchange="editMat('${room.id}',${i},'unit',this.value)">
+          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}',${i},'unit',this.value)">
       </div>
       <div class="mat-link">
         <input type="url" value="${escHtml(m.link || '')}" placeholder="https://..."
           style="width:120px;font-size:12px;padding:3px 6px;border-radius:6px;border:0.5px solid #ddd"
-          onchange="editMat('${room.id}',${i},'link',this.value)">
+          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}',${i},'link',this.value)">
         ${m.link ? `<br><a href="${escHtml(m.link)}" target="_blank" rel="noopener">↗ otwórz</a>` : ''}
       </div>
       <div class="mat-del"><button onclick="delMat('${room.id}',${i})" title="Usuń">×</button></div>
@@ -264,7 +285,7 @@ function renderContent() {
   el.innerHTML = `
     <div class="room-header">
       <div class="room-title-row">
-        <div class="room-title" contenteditable="true" onblur="renameRoom('${room.id}',this.innerText)">${escHtml(room.name)}</div>
+        <div class="room-title" contenteditable="true" onfocus="setEditing(true)" onblur="setEditing(false);renameRoom('${room.id}',this.innerText)">${escHtml(room.name)}</div>
         ${total ? `<span class="progress-badge">${done}/${total} kupione</span>` : ''}
       </div>
       <div class="room-actions">
@@ -275,7 +296,7 @@ function renderContent() {
       </div>
     </div>
     <div class="room-notes-section">
-      <textarea class="room-notes" placeholder="Notatki do pomieszczenia..." onblur="renameRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
+      <textarea class="room-notes" placeholder="Notatki do pomieszczenia..." onfocus="setEditing(true)" onblur="setEditing(false);renameRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
     </div>
     <div class="summary-bar">
       <div class="sum-card"><div class="sum-label">Wszystkich pozycji</div><div class="sum-val">${total}</div></div>
@@ -299,10 +320,14 @@ function renderContent() {
       </div>
       <div class="add-mat-row">
         <input class="in-name" id="in-name" placeholder="Nazwa materiału..."
+          onfocus="setEditing(true)" onblur="setEditing(false)"
           onkeydown="if(event.key==='Enter')addMat('${room.id}')">
-        <input class="in-qty" type="number" id="in-qty" placeholder="Ilość" min="0" step="0.1">
-        <input class="in-unit" id="in-unit" placeholder="szt.">
-        <input class="in-link" type="url" id="in-link" placeholder="https://... (opcjonalnie)">
+        <input class="in-qty" type="number" id="in-qty" placeholder="Ilość" min="0" step="0.1"
+          onfocus="setEditing(true)" onblur="setEditing(false)">
+        <input class="in-unit" id="in-unit" placeholder="szt."
+          onfocus="setEditing(true)" onblur="setEditing(false)">
+        <input class="in-link" type="url" id="in-link" placeholder="https://... (opcjonalnie)"
+          onfocus="setEditing(true)" onblur="setEditing(false)">
         <button class="btn primary" onclick="addMat('${room.id}')">Dodaj</button>
       </div>
     </div>`;
@@ -338,8 +363,9 @@ function initMatSortable(roomId) {
 function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
 window.selectRoom = function(id) { 
+  if (state.activeRoom === id) return;
   state.activeRoom = id; 
-  render();
+  render(false); // No need to push state just because we changed local tab
   window.toggleSidebar(false);
 };
 
