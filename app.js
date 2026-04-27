@@ -107,22 +107,34 @@ function init() {
     console.log("[Firestore] attaching listener to", FIRESTORE_DOC);
     setBanner("sync", "Łączenie z Firestore…");
     unsubscribe = onSnapshot(doc(db, FIRESTORE_DOC), snapshot => {
-      if (snapshot.metadata.hasPendingWrites) return;
+      console.log("[Firestore] snapshot received, exists:", snapshot.exists(), "fromCache:", snapshot.metadata.fromCache);
+      if (snapshot.metadata.hasPendingWrites) {
+        console.log("[Firestore] pending writes, skipping update");
+        return;
+      }
       if (snapshot.exists()) {
         const remote = snapshot.data();
+        console.log("[Firestore] data loaded:", remote.rooms?.length, "rooms");
         state.rooms = remote.rooms || [];
         state.activeRoom = remote.activeRoom || (state.rooms[0]?.id ?? null);
-        // We no longer call loadLocalImages() because images are now remote
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
       } else {
-        // First time — push local state to Firestore
-        save(true);
+        // First time OR document deleted — push local state to Firestore if it has data
+        console.log("[Firestore] document does not exist");
+        if (state.rooms.length > 0) {
+          console.log("[Firestore] pushing local state to new document");
+          save(true);
+        }
       }
       setBanner("sync", "Zsynchronizowano", 2000);
       render(false);
     }, err => {
       console.error("Firestore listen failed:", err);
       setBanner("error", "Błąd połączenia: " + (err.code || err.message));
+      // Fallback to local if permission denied
+      if (err.code === 'permission-denied') {
+        console.warn("[Firestore] access denied - check Security Rules");
+      }
     });
   } else {
     setBanner("local", "Tryb lokalny (bez synchronizacji)");
@@ -365,8 +377,9 @@ window.addImages = function(roomId, evt) {
     try {
       console.log(`[Storage] Uploading ${f.name} to ${path}...`);
       const snapshot = await uploadBytes(storageRef, f);
+      console.log(`[Storage] Upload successful for ${f.name}`);
       const url = await getDownloadURL(snapshot.ref);
-      console.log(`[Storage] Uploaded ${f.name} -> ${url}`);
+      console.log(`[Storage] URL obtained: ${url}`);
       
       // Get FRESH room reference to avoid race conditions with sync
       const r = getRoom(roomId);
@@ -378,9 +391,9 @@ window.addImages = function(roomId, evt) {
         failCount++;
       }
     } catch (err) {
-      console.error(`[Storage] Upload failed for ${f.name}:`, err);
+      console.error(`[Storage] Error during upload of ${f.name}:`, err.code, err.message);
       failCount++;
-      setBanner("error", "Błąd przesyłania: " + err.message);
+      setBanner("error", "Błąd: " + (err.code || err.message));
     }
   });
 
