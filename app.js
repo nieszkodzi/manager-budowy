@@ -129,6 +129,7 @@ function init() {
         state.rooms = remoteRooms;
         state.activeRoom = remote.activeRoom || (state.rooms[0]?.id ?? null);
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
+        setBanner("sync", "Zsynchronizowano", 2000);
       } else {
         // First time OR document deleted — push local state to Firestore if it has data
         console.log("[Firestore] document does not exist");
@@ -136,8 +137,8 @@ function init() {
           console.log("[Firestore] pushing local state to new document");
           save(true);
         }
+        setBanner("sync", "Gotowy (nowy dokument)", 2000);
       }
-      setBanner("sync", "Zsynchronizowano", 2000);
       render(false);
     }, err => {
       console.error("Firestore listen failed:", err);
@@ -191,8 +192,11 @@ function renderSidebar() {
     const total = r.materials.length, done = r.materials.filter(m => m.done).length;
     const cls = total === 0 ? 'empty' : done === total ? 'done' : 'partial';
     const active = r.id === state.activeRoom ? 'active' : '';
-    return `<div class="room-item ${active}" data-id="${r.id}" onclick="selectRoom('${r.id}')">
-      <div class="room-dot ${cls}"></div><span>${escHtml(r.name)}</span>
+    return `<div class="room-item ${active}" data-id="${r.id}">
+      <div class="drag-handle">⋮⋮</div>
+      <div class="room-click-area" onclick="selectRoom('${r.id}')">
+        <div class="room-dot ${cls}"></div><span>${escHtml(r.name)}</span>
+      </div>
     </div>`;
   }).join('');
   initRoomSortable();
@@ -207,6 +211,7 @@ function initRoomSortable() {
   }
   roomSortable = Sortable.create(el, {
     animation: 150,
+    handle: '.drag-handle',
     ghostClass: 'sortable-ghost',
     onEnd: (evt) => {
       const moved = state.rooms.splice(evt.oldIndex, 1)[0];
@@ -231,8 +236,12 @@ function renderContent() {
 
   const matRows = room.materials.map((m, i) => `
     <div class="mat-row ${m.done ? 'done-row' : ''}" data-idx="${i}">
+      <div class="drag-handle">⋮⋮</div>
       <input type="checkbox" class="mat-check" ${m.done ? 'checked' : ''} onchange="toggleMat('${room.id}',${i})">
-      <div class="mat-name" contenteditable="true" onblur="editMat('${room.id}',${i},'name',this.innerText)">${escHtml(m.name)}</div>
+      <div class="mat-name-cell">
+        <div class="mat-name" contenteditable="true" onblur="editMat('${room.id}',${i},'name',this.innerText)">${escHtml(m.name)}</div>
+        <textarea class="mat-notes" placeholder="Notatki..." onblur="editMat('${room.id}',${i},'notes',this.value)">${escHtml(m.notes || '')}</textarea>
+      </div>
       <div class="mat-qty">
         <input type="number" value="${m.qty}" min="0" step="0.1"
           style="width:60px;font-size:13px;padding:3px 6px;border-radius:6px;border:0.5px solid #ddd;text-align:center"
@@ -265,6 +274,9 @@ function renderContent() {
         <button class="btn danger" onclick="deleteRoom('${room.id}')">Usuń pomieszczenie</button>
       </div>
     </div>
+    <div class="room-notes-section">
+      <textarea class="room-notes" placeholder="Notatki do pomieszczenia..." onblur="renameRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
+    </div>
     <div class="summary-bar">
       <div class="sum-card"><div class="sum-label">Wszystkich pozycji</div><div class="sum-val">${total}</div></div>
       <div class="sum-card"><div class="sum-label">Kupione</div><div class="sum-val" style="color:#3B6D11">${done}</div></div>
@@ -274,6 +286,7 @@ function renderContent() {
     ${room.images.length ? `<div class="img-section"><div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div></div>` : ''}
     <div class="materials-section">
       <div class="mat-header">
+        <div style="width:24px"></div>
         <div style="width:16px"></div>
         <div style="flex:2">Materiał / produkt</div>
         <div style="width:70px;text-align:center">Ilość</div>
@@ -305,6 +318,7 @@ function initMatSortable(roomId) {
   if (!el || (el.children.length <= 1 && el.innerText.includes('Brak'))) return;
   matSortable = Sortable.create(el, {
     animation: 150,
+    handle: '.drag-handle',
     ghostClass: 'sortable-ghost',
     onEnd: (evt) => {
       const room = getRoom(roomId);
@@ -343,6 +357,10 @@ window.renameRoom = function(id, name) {
   const r = getRoom(id); if (r && name.trim()) { r.name = name.trim(); render(true); }
 };
 
+window.renameRoomNotes = function(id, notes) {
+  const r = getRoom(id); if (r) { r.notes = notes; save(true); }
+};
+
 window.addRoom = function() {
   showModal('Nowe pomieszczenie', () => `<input id="modal-input" placeholder="Nazwa pomieszczenia..." onkeydown="if(event.key==='Enter')modalConfirm()">`,
     val => { if (!val || !val.trim()) return; const r = { id: uid(), name: val.trim(), images: [], materials: [] }; state.rooms.push(r); state.activeRoom = r.id; render(); });
@@ -362,7 +380,7 @@ window.addMat = function(roomId) {
   const qty = parseFloat(document.getElementById('in-qty').value) || 1;
   const unit = document.getElementById('in-unit').value.trim() || 'szt.';
   const link = document.getElementById('in-link').value.trim();
-  getRoom(roomId).materials.push({ id: uid(), name, qty, unit, link, done: false });
+  getRoom(roomId).materials.push({ id: uid(), name, qty, unit, link, done: false, notes: '' });
   render(true);
   document.getElementById('in-name')?.focus();
 };
