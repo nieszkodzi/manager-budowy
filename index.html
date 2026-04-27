@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Remont — Materiały</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">Remont domu</div>
+  <div class="header-btns">
+    <button class="btn share" onclick="openShareModal()">Udostępnij</button>
+    <button class="btn" onclick="window.print()">Drukuj / PDF</button>
+    <button class="btn primary" onclick="exportJSON()">Eksportuj JSON</button>
+    <label class="btn" style="cursor:pointer">Importuj JSON
+      <input type="file" accept=".json" onchange="importJSON(event)">
+    </label>
+  </div>
+</header>
+
+<div class="main">
+  <div class="sidebar">
+    <div class="sidebar-title">Pomieszczenia</div>
+    <div id="room-list"></div>
+    <button class="add-room-btn" onclick="addRoom()">+ Dodaj pomieszczenie</button>
+  </div>
+  <div class="content" id="content">
+    <div class="empty-state">Wybierz pomieszczenie z listy po lewej</div>
+  </div>
+</div>
+
+<div id="modal" class="modal-overlay" style="display:none">
+  <div class="modal">
+    <h3 id="modal-title"></h3>
+    <div id="modal-body"></div>
+    <div class="modal-btns" id="modal-btns"></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
