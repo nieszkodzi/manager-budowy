@@ -335,35 +335,62 @@ window.delMat = function(roomId, idx) { getRoom(roomId).materials.splice(idx, 1)
 window.addImages = function(roomId, evt) {
   if (!storage) {
     alert("Cloud Storage nie jest skonfigurowany. Zdjęcia pozostaną tylko lokalnie.");
-    // Fallback to local only if storage is missing
     const r = getRoom(roomId);
+    if (!r) return;
     [...evt.target.files].forEach(f => {
       const fr = new FileReader();
-      fr.onload = e => { r.images.push({ data: e.target.result, name: f.name }); render(); };
+      fr.onload = e => {
+        r.images.push({ data: e.target.result, name: f.name });
+        render();
+      };
       fr.readAsDataURL(f);
     });
     return;
   }
 
-  const r = getRoom(roomId);
-  setBanner("sync", "Przesyłanie zdjęć…");
+  const files = [...evt.target.files];
+  if (!files.length) return;
+
+  setBanner("sync", `Przesyłanie ${files.length} zdjęć…`);
+  console.log(`[Storage] Starting upload of ${files.length} files for room ${roomId}`);
   
-  const uploads = [...evt.target.files].map(async f => {
-    const path = `rooms/${roomId}/${uid()}_${f.name}`;
+  let successCount = 0;
+  let failCount = 0;
+
+  const uploads = files.map(async f => {
+    const fileId = uid();
+    const path = `rooms/${roomId}/${fileId}_${f.name}`;
     const storageRef = ref(storage, path);
+    
     try {
+      console.log(`[Storage] Uploading ${f.name} to ${path}...`);
       const snapshot = await uploadBytes(storageRef, f);
       const url = await getDownloadURL(snapshot.ref);
-      r.images.push({ url, path, name: f.name });
+      console.log(`[Storage] Uploaded ${f.name} -> ${url}`);
+      
+      // Get FRESH room reference to avoid race conditions with sync
+      const r = getRoom(roomId);
+      if (r) {
+        r.images.push({ url, path, name: f.name });
+        successCount++;
+      } else {
+        console.error(`[Storage] Room ${roomId} not found after upload!`);
+        failCount++;
+      }
     } catch (err) {
-      console.error("Upload failed:", err);
+      console.error(`[Storage] Upload failed for ${f.name}:`, err);
+      failCount++;
       setBanner("error", "Błąd przesyłania: " + err.message);
     }
   });
 
   Promise.all(uploads).then(() => {
-    setBanner("sync", "Zdjęcia przesłane", 2000);
-    render(true);
+    if (successCount > 0) {
+      setBanner("sync", failCount > 0 ? `Przesłano ${successCount}, błąd ${failCount}` : "Zdjęcia przesłane", 3000);
+      render(true);
+    } else if (failCount > 0) {
+      setBanner("error", "Nie udało się przesłać zdjęć");
+    }
   });
 };
 
