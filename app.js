@@ -8,12 +8,26 @@ import { getFirestore, doc, onSnapshot, setDoc } from "https://www.gstatic.com/f
 const cfg = window.FIREBASE_CONFIG || {};
 const firebaseReady = cfg.apiKey && !cfg.apiKey.startsWith("YOUR_");
 
+console.log("[Firebase] config loaded:", !!window.FIREBASE_CONFIG);
+console.log("[Firebase] firebaseReady:", firebaseReady);
+if (window.FIREBASE_CONFIG) {
+  console.log("[Firebase] projectId:", window.FIREBASE_CONFIG.projectId);
+  console.log("[Firebase] apiKey starts with:", window.FIREBASE_CONFIG.apiKey?.slice(0, 8));
+}
+
 let db = null;
 let unsubscribe = null;
 
 if (firebaseReady) {
-  const app = initializeApp(cfg);
-  db = getFirestore(app);
+  try {
+    const app = initializeApp(cfg);
+    db = getFirestore(app);
+    console.log("[Firebase] initialized OK");
+  } catch (e) {
+    console.error("[Firebase] init error:", e);
+  }
+} else {
+  console.warn("[Firebase] skipping init — config missing or placeholder");
 }
 
 // ---------------------------------------------------------------------------
@@ -50,13 +64,12 @@ function stateForStorage() {
   };
 }
 
-function save() {
+function save(pushToFirestore = true) {
   localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
-  if (db) {
-    ignoreNextRemoteUpdate = true;
+  if (db && pushToFirestore) {
     setDoc(doc(db, FIRESTORE_DOC), stateForStorage()).catch(err => {
       console.error("Firestore write failed:", err);
-      ignoreNextRemoteUpdate = false;
+      setBanner("error", "Błąd zapisu: " + (err.code || err.message));
     });
   }
 }
@@ -82,9 +95,10 @@ function init() {
   if (!state.activeRoom && state.rooms.length) state.activeRoom = state.rooms[0].id;
 
   if (db) {
+    console.log("[Firestore] attaching listener to", FIRESTORE_DOC);
     setBanner("sync", "Łączenie z Firestore…");
     unsubscribe = onSnapshot(doc(db, FIRESTORE_DOC), snapshot => {
-      if (ignoreNextRemoteUpdate) { ignoreNextRemoteUpdate = false; return; }
+      if (snapshot.metadata.hasPendingWrites) return;
       if (snapshot.exists()) {
         const remote = snapshot.data();
         // Merge: keep active room from remote, restore local images
@@ -94,13 +108,13 @@ function init() {
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
       } else {
         // First time — push local state to Firestore
-        save();
+        save(true);
       }
       setBanner("sync", "Zsynchronizowano", 2000);
-      render();
+      render(false);
     }, err => {
       console.error("Firestore listen failed:", err);
-      setBanner("error", "Brak połączenia z Firestore — tryb lokalny");
+      setBanner("error", "Błąd połączenia: " + (err.code || err.message));
     });
   } else {
     setBanner("local", "Tryb lokalny (bez synchronizacji)");
@@ -138,7 +152,7 @@ function setBanner(type, text, autoClearMs = 0) {
 // Render
 // ---------------------------------------------------------------------------
 
-function render() { renderSidebar(); renderContent(); save(); }
+function render(pushToFirestore = true) { renderSidebar(); renderContent(); save(pushToFirestore); }
 
 function renderSidebar() {
   const el = document.getElementById('room-list');
@@ -244,7 +258,7 @@ function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g
 window.selectRoom = function(id) { state.activeRoom = id; render(); };
 
 window.renameRoom = function(id, name) {
-  const r = getRoom(id); if (r && name.trim()) { r.name = name.trim(); save(); renderSidebar(); }
+  const r = getRoom(id); if (r && name.trim()) { r.name = name.trim(); render(true); }
 };
 
 window.addRoom = function() {
@@ -260,13 +274,15 @@ window.deleteRoom = function(id) {
 };
 
 window.addMat = function(roomId) {
-  const name = document.getElementById('in-name').value.trim();
+  const nameInp = document.getElementById('in-name');
+  const name = nameInp.value.trim();
   if (!name) return;
   const qty = parseFloat(document.getElementById('in-qty').value) || 1;
   const unit = document.getElementById('in-unit').value.trim() || 'szt.';
   const link = document.getElementById('in-link').value.trim();
   getRoom(roomId).materials.push({ id: uid(), name, qty, unit, link, done: false });
-  render();
+  render(true);
+  document.getElementById('in-name')?.focus();
 };
 
 window.toggleMat = function(roomId, idx) { getRoom(roomId).materials[idx].done = !getRoom(roomId).materials[idx].done; render(); };
@@ -274,7 +290,7 @@ window.toggleMat = function(roomId, idx) { getRoom(roomId).materials[idx].done =
 window.editMat = function(roomId, idx, field, val) {
   const r = getRoom(roomId);
   r.materials[idx][field] = field === 'qty' ? (parseFloat(val) || 0) : val.trim();
-  save(); renderSidebar();
+  render(true);
 };
 
 window.moveMat = function(roomId, idx, dir) {
