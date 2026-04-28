@@ -20,6 +20,12 @@ let db = null;
 let storage = null;
 let unsubscribe = null;
 let pendingSaveCount = 0; // number of setDoc calls not yet acknowledged by Firestore
+let saveDebounceTimer = null;
+
+function debouncedSave() {
+  clearTimeout(saveDebounceTimer);
+  saveDebounceTimer = setTimeout(() => save(true), 600);
+}
 
 if (firebaseReady) {
   try {
@@ -146,13 +152,15 @@ function init() {
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
         setBanner("sync", "Zsynchronizowano", 2000);
       } else {
-        // Document deleted or first run — push local state to Firestore if it has data
-        console.log("[Firestore] document does not exist");
-        if (state.rooms.length > 0) {
-          console.log("[Firestore] pushing local state to new document");
-          save(true);
-        }
-        setBanner("sync", "Gotowy (nowy dokument)", 2000);
+        // Document does not exist in Firestore. This can happen on a genuine
+        // first run, but also transiently when the SDK reconnects from
+        // offline/background before the server confirms the cached document.
+        // We NEVER push local state here — doing so would overwrite real data
+        // with a stale local copy (e.g. a phone waking up from sleep).
+        // On a true first run the document will be created the first time the
+        // user makes a change (addMat, addRoom, etc.) which calls save(true).
+        console.log("[Firestore] document does not exist — waiting for first user action to create it");
+        setBanner("sync", "Gotowy", 2000);
       }
       render(false);
     }, err => {
@@ -283,9 +291,7 @@ function renderContent() {
       <div class="mat-name-cell">
         <div class="mat-name" contenteditable="true" onfocus="setEditing(true)" onblur="setEditing(false);editMat('${room.id}','${m.id}','name',this.innerText)">${escHtml(m.name)}</div>
         <textarea class="mat-notes" placeholder="Notatki..."
-          onfocus="setEditing(true)"
-          oninput="autoResize(this)"
-          onblur="setEditing(false);editMat('${room.id}','${m.id}','notes',this.value)">${escHtml(m.notes || '')}</textarea>
+          oninput="autoResize(this);updateMatField('${room.id}','${m.id}','notes',this.value)">${escHtml(m.notes || '')}</textarea>
       </div>
       <div class="mat-qty">
         <input type="number" value="${m.qty}" min="0" step="0.1"
@@ -331,9 +337,7 @@ function renderContent() {
     </div>
     <div class="room-notes-section">
       <textarea class="room-notes" placeholder="Notatki do pomieszczenia..."
-        onfocus="setEditing(true)"
-        oninput="autoResize(this)"
-        onblur="setEditing(false);renameRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
+        oninput="autoResize(this);updateRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
     </div>
     <div class="summary-bar">
       <div class="sum-card"><div class="sum-label">Wszystkich pozycji</div><div class="sum-val">${total}</div></div>
@@ -438,6 +442,19 @@ window.renameRoom = function(id, name) {
 
 window.renameRoomNotes = function(id, notes) {
   const r = getRoom(id); if (r) { r.notes = notes; save(true); }
+};
+
+// Called on every oninput keystroke — writes to state immediately and debounces the Firestore save.
+window.updateRoomNotes = function(id, notes) {
+  const r = getRoom(id); if (!r) return;
+  r.notes = notes;
+  debouncedSave();
+};
+
+window.updateMatField = function(roomId, matId, field, val) {
+  const m = findMat(roomId, matId); if (!m) return;
+  m[field] = val;
+  debouncedSave();
 };
 
 window.addRoom = function() {
