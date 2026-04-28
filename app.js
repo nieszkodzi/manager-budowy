@@ -108,7 +108,7 @@ function stateForStorage() {
 }
 
 function save(pushToFirestore = true) {
-  state.updatedAt = Date.now();
+  if (pushToFirestore) state.updatedAt = Date.now();
   localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
   if (db && pushToFirestore) {
     pendingSaveCount++;
