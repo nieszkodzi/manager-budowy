@@ -475,7 +475,10 @@ window.addImages = function(roomId, evt) {
   setBanner("sync", `Przesyłanie ${files.length} zdjęć…`);
   console.log(`[Storage] Starting upload of ${files.length} files for room ${roomId}`);
 
-  let successCount = 0;
+  // Collect results in a local array — never touch state.rooms inside the async callbacks.
+  // This prevents a Firestore snapshot that fires between two awaits from causing
+  // some images to be pushed to a detached (replaced) room object and lost.
+  const newImages = [];
   let failCount = 0;
 
   const uploads = files.map(async f => {
@@ -485,20 +488,11 @@ window.addImages = function(roomId, evt) {
 
     try {
       console.log(`[Storage] Uploading ${f.name} to ${path}...`);
-      const snapshot = await uploadBytes(storageRef, f);
+      const snap = await uploadBytes(storageRef, f);
       console.log(`[Storage] Upload successful for ${f.name}`);
-      const url = await getDownloadURL(snapshot.ref);
+      const url = await getDownloadURL(snap.ref);
       console.log(`[Storage] URL obtained: ${url}`);
-
-      // Get FRESH room reference — state may have been updated by a snapshot during upload
-      const r = getRoom(roomId);
-      if (r) {
-        r.images.push({ id: uid(), url, path, name: f.name });
-        successCount++;
-      } else {
-        console.error(`[Storage] Room ${roomId} not found after upload!`);
-        failCount++;
-      }
+      newImages.push({ id: uid(), url, path, name: f.name });
     } catch (err) {
       console.error(`[Storage] Error during upload of ${f.name}:`, err.code, err.message);
       failCount++;
@@ -507,10 +501,18 @@ window.addImages = function(roomId, evt) {
   });
 
   Promise.all(uploads).then(() => {
-    if (successCount > 0) {
-      console.log(`[Storage] Finished ${successCount} uploads, saving state...`);
-      setBanner("sync", failCount > 0 ? `Przesłano ${successCount}, błąd ${failCount}` : "Zdjęcia przesłane", 3000);
-      render(true);
+    if (newImages.length > 0) {
+      // Get a single fresh room reference after all uploads are done and apply atomically.
+      const r = getRoom(roomId);
+      if (r) {
+        console.log(`[Storage] Pushing ${newImages.length} images to room atomically`);
+        r.images.push(...newImages);
+        setBanner("sync", failCount > 0 ? `Przesłano ${newImages.length}, błąd ${failCount}` : "Zdjęcia przesłane", 3000);
+        render(true);
+      } else {
+        console.error(`[Storage] Room ${roomId} not found — files uploaded to Storage but not linked`);
+        setBanner("error", "Pokój nie istnieje — zdjęcia przesłane do Storage, ale nie zapisane");
+      }
     } else if (failCount > 0) {
       console.error(`[Storage] All uploads failed`);
       setBanner("error", "Nie udało się przesłać zdjęć");
