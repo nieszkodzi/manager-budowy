@@ -92,6 +92,7 @@ const FIRESTORE_DOC = 'shared/state';
 
 function stateForStorage() {
   return {
+    updatedAt: state.updatedAt || 0,
     rooms: state.rooms.map(r => ({
       ...r,
       images: r.images.map(img => ({
@@ -99,14 +100,15 @@ function stateForStorage() {
         name: img.name,
         url: img.url,
         path: img.path,
-        deleted: img.deleted
-        // data (local data URLs) intentionally not persisted to Firestore
+        deleted: img.deleted,
+        description: img.description
       }))
     }))
   };
 }
 
 function save(pushToFirestore = true) {
+  state.updatedAt = Date.now();
   localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
   if (db && pushToFirestore) {
     pendingSaveCount++;
@@ -152,14 +154,22 @@ function init() {
 
       if (snapshot.exists()) {
         const remote = snapshot.data();
-        console.log("[Firestore] applying remote state");
+        const remoteTs = remote.updatedAt || 0;
+        const localTs = state.updatedAt || 0;
+        if (remoteTs <= localTs) {
+          console.log("[Firestore] remote is not newer (remote:", remoteTs, "local:", localTs, "), ignoring");
+          return;
+        }
+        console.log("[Firestore] applying remote state (remote:", remoteTs, "local:", localTs, ")");
         state.rooms = remote.rooms || [];
+        state.updatedAt = remoteTs;
         ensureIds();
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
         setBanner("sync", "Zsynchronizowano", 2000);
       } else {
         console.log("[Firestore] document does not exist — waiting for first user action to create it");
         setBanner("sync", "Gotowy", 2000);
+        return;
       }
       render(false);
     }, err => {
@@ -173,7 +183,7 @@ function init() {
     setBanner("local", "Tryb lokalny (bez synchronizacji)");
   }
 
-  render();
+  render(false);
 }
 
 window.addEventListener('beforeunload', () => { if (unsubscribe) unsubscribe(); });
