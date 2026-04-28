@@ -1,10 +1,10 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js";
 import {
   initializeFirestore, persistentLocalCache,
-  collection, doc, addDoc, setDoc, updateDoc,
-  onSnapshot, writeBatch
+  collection, doc, addDoc, setDoc, updateDoc, deleteDoc,
+  onSnapshot, writeBatch, runTransaction, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js";
-import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-storage.js";
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-storage.js";
 
 // ---------------------------------------------------------------------------
 // Firebase setup
@@ -61,8 +61,9 @@ let activeRoomId    = localStorage.getItem('activeRoom') || null;
 let subscribedRoomId = null;
 
 let unsubRooms     = null;
-let unsubMaterials = null;
-let unsubPhotos    = null;
+let unsubMaterials = null;  // active room only
+let unsubPhotos    = null;  // active room only
+const unsubAllMats = new Map(); // roomId -> unsub fn  (kept for sidebar counts)
 let roomSortable   = null;
 let matSortable    = null;
 let modalCb        = null;
@@ -94,13 +95,35 @@ function subscribeToRooms() {
   if (!db) return;
   unsubRooms = onSnapshot(roomsCol(), snap => {
     snap.forEach(d => roomsMap.set(d.id, { id: d.id, ...d.data() }));
-    snap.docChanges().forEach(ch => { if (ch.type === 'removed') roomsMap.delete(ch.doc.id); });
+    snap.docChanges().forEach(ch => {
+      if (ch.type === 'removed') {
+        roomsMap.delete(ch.doc.id);
+        const u = unsubAllMats.get(ch.doc.id);
+        if (u) { u(); unsubAllMats.delete(ch.doc.id); }
+      }
+    });
 
-    // Seed default rooms on very first load (empty server collection)
+    // Seed default rooms on very first load — race-safe via transaction
     if (snap.empty && !snap.metadata.fromCache) {
       seedDefaultRooms();
       return;
     }
+
+    // Subscribe to each room's materials for sidebar counts
+    snap.docChanges().forEach(ch => {
+      if ((ch.type === 'added') && !unsubAllMats.has(ch.doc.id)) {
+        const rId = ch.doc.id;
+        const unsub = onSnapshot(matsCol(rId), mSnap => {
+          if (!matsMap.has(rId)) matsMap.set(rId, new Map());
+          const m = matsMap.get(rId);
+          mSnap.forEach(d => m.set(d.id, { id: d.id, ...d.data() }));
+          mSnap.docChanges().forEach(mc => { if (mc.type === 'removed') m.delete(mc.doc.id); });
+          renderSidebar();
+          if (rId === activeRoomId) renderContent();
+        }, err => console.error("[Firestore] materials:", err));
+        unsubAllMats.set(rId, unsub);
+      }
+    });
 
     // Fix activeRoomId if the room was deleted or never existed
     if (!activeRoomId || !roomsMap.has(activeRoomId) || getRoom(activeRoomId)?.deleted) {
@@ -121,18 +144,12 @@ function subscribeToRooms() {
 function subscribeToRoom(roomId) {
   if (subscribedRoomId === roomId) return;
   subscribedRoomId = roomId;
-  if (unsubMaterials) { unsubMaterials(); unsubMaterials = null; }
-  if (unsubPhotos)    { unsubPhotos();    unsubPhotos    = null; }
+  if (unsubPhotos) { unsubPhotos(); unsubPhotos = null; }
 
   if (!roomId || !db) { renderContent(); return; }
 
-  unsubMaterials = onSnapshot(matsCol(roomId), snap => {
-    if (!matsMap.has(roomId)) matsMap.set(roomId, new Map());
-    const m = matsMap.get(roomId);
-    snap.forEach(d => m.set(d.id, { id: d.id, ...d.data() }));
-    snap.docChanges().forEach(ch => { if (ch.type === 'removed') m.delete(ch.doc.id); });
-    renderContent();
-  }, err => console.error("[Firestore] materials:", err));
+  // Materials are already subscribed globally via unsubAllMats — just re-render
+  renderContent();
 
   unsubPhotos = onSnapshot(photosCol(roomId), snap => {
     if (!photosMap.has(roomId)) photosMap.set(roomId, new Map());
@@ -144,12 +161,20 @@ function subscribeToRoom(roomId) {
 }
 
 async function seedDefaultRooms() {
-  console.log("[Firestore] seeding default rooms");
-  const batch = writeBatch(db);
-  ROOMS_DEFAULT.forEach((name, i) => {
-    batch.set(doc(roomsCol()), { name, notes: '', order: i * 1000, deleted: false });
-  });
-  await batch.commit();
+  const sentinelRef = doc(db, "projects", PROJECT, "_meta", "seeded");
+  try {
+    await runTransaction(db, async tx => {
+      const snap = await tx.get(sentinelRef);
+      if (snap.exists()) return; // another device already seeded
+      tx.set(sentinelRef, { at: serverTimestamp() });
+      ROOMS_DEFAULT.forEach((name, i) => {
+        tx.set(doc(roomsCol()), { name, notes: '', order: i * 1000, deleted: false });
+      });
+    });
+    console.log("[Firestore] seeded default rooms");
+  } catch (e) {
+    console.warn("[Firestore] seed skipped or failed:", e.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,10 +268,10 @@ function renderContent() {
       <input type="checkbox" class="mat-check" ${m.done ? 'checked' : ''} onchange="toggleMat('${room.id}','${m.id}')">
       <div class="mat-name-cell">
         <div class="mat-name" contenteditable="true"
-          onfocus="setEditing(true)"
+          onfocus="matFocus('${room.id}','${m.id}','name',this.innerText)"
           onblur="setEditing(false);editMat('${room.id}','${m.id}','name',this.innerText)">${escHtml(m.name)}</div>
         <textarea class="mat-notes" placeholder="Notatki..."
-          onfocus="setEditing(true);autoResize(this)"
+          onfocus="matFocus('${room.id}','${m.id}','notes',this.value);autoResize(this)"
           oninput="autoResize(this)"
           onblur="setEditing(false);editMat('${room.id}','${m.id}','notes',this.value)">${escHtml(m.notes || '')}</textarea>
       </div>
@@ -410,15 +435,19 @@ window.openTrash = function(roomId) {
         html += deletedMats.map(m => `<div class="trash-row">
           <span style="flex:1;font-size:13px">${escHtml(m.name)}</span>
           <button class="btn" style="font-size:12px;padding:4px 10px" onclick="restoreMat('${roomId}','${m.id}')">Przywróć</button>
+          <button class="btn danger" style="font-size:12px;padding:4px 10px" onclick="permDeleteMat('${roomId}','${m.id}')">Usuń trwale</button>
         </div>`).join('');
       }
       if (deletedImgs.length) {
         html += `<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin:12px 0 8px">Zdjęcia</div>`;
         html += `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px">`;
         html += deletedImgs.map(img => `
-          <div style="position:relative;width:80px;height:60px;border-radius:6px;overflow:hidden;border:0.5px solid #ddd">
-            <img src="${escHtml(img.url)}" style="width:100%;height:100%;object-fit:cover;opacity:0.5">
-            <button class="btn" style="position:absolute;bottom:2px;right:2px;font-size:10px;padding:2px 6px" onclick="restorePhoto('${roomId}','${img.id}')">↩</button>
+          <div style="position:relative;width:80px;height:80px;border-radius:6px;overflow:hidden;border:0.5px solid #ddd;display:flex;flex-direction:column">
+            <img src="${escHtml(img.url)}" style="width:100%;flex:1;object-fit:cover;opacity:0.5">
+            <div style="display:flex;gap:2px;padding:2px">
+              <button class="btn" style="flex:1;font-size:10px;padding:2px 4px" onclick="restorePhoto('${roomId}','${img.id}')">↩</button>
+              <button class="btn danger" style="flex:1;font-size:10px;padding:2px 4px" onclick="permDeletePhoto('${roomId}','${img.id}','${escHtml(img.path || '')}')">✕</button>
+            </div>
           </div>`).join('');
         html += '</div>';
       }
@@ -430,6 +459,7 @@ window.openTrash = function(roomId) {
         html += deletedRooms.map(r => `<div class="trash-row">
           <span style="flex:1;font-size:13px">${escHtml(r.name)}</span>
           <button class="btn" style="font-size:12px;padding:4px 10px" onclick="restoreRoom('${r.id}')">Przywróć</button>
+          <button class="btn danger" style="font-size:12px;padding:4px 10px" onclick="permDeleteRoom('${r.id}')">Usuń trwale</button>
         </div>`).join('');
       }
       const withDeleted = [...roomsMap.keys()].filter(rId => {
@@ -470,6 +500,41 @@ window.restoreMat = function(roomId, matId) {
 window.restorePhoto = function(roomId, photoId) {
   if (!db) return;
   updateDoc(photoDoc(roomId, photoId), { deleted: false });
+  closeModal();
+};
+
+window.permDeleteMat = async function(roomId, matId) {
+  if (!db || !confirm('Usunąć trwale? Tej operacji nie można cofnąć.')) return;
+  await deleteDoc(matDoc(roomId, matId));
+  closeModal();
+};
+
+window.permDeletePhoto = async function(roomId, photoId, storagePath) {
+  if (!db || !confirm('Usunąć trwale zdjęcie? Tej operacji nie można cofnąć.')) return;
+  if (storage && storagePath) {
+    try { await deleteObject(ref(storage, storagePath)); }
+    catch (e) { console.warn('[Storage] delete failed:', e.message); }
+  }
+  await deleteDoc(photoDoc(roomId, photoId));
+  closeModal();
+};
+
+window.permDeleteRoom = async function(roomId) {
+  if (!db || !confirm('Usunąć trwale pomieszczenie ze wszystkimi materiałami i zdjęciami? Tej operacji nie można cofnąć.')) return;
+  // Delete all materials and photos first, then the room doc
+  const mats   = allMats(roomId);
+  const photos = allPhotos(roomId);
+  const batch  = writeBatch(db);
+  mats.forEach(m   => batch.delete(matDoc(roomId, m.id)));
+  photos.forEach(p => batch.delete(photoDoc(roomId, p.id)));
+  batch.delete(roomDoc(roomId));
+  await batch.commit();
+  // Clean up Storage for photos with paths
+  if (storage) {
+    photos.forEach(p => {
+      if (p.path) deleteObject(ref(storage, p.path)).catch(() => {});
+    });
+  }
   closeModal();
 };
 
@@ -542,7 +607,7 @@ window.addMat = function(roomId) {
   const priceEst     = priceEstRaw   !== '' ? parseFloat(priceEstRaw)   : null;
   const priceFinal   = priceFinalRaw !== '' ? parseFloat(priceFinalRaw) : null;
   const order        = nextOrder(liveMats(roomId));
-  addDoc(matsCol(roomId), { name, qty, unit, link, done: false, notes: '', priceEst, priceFinal, order, deleted: false });
+  addDoc(matsCol(roomId), { name, qty, unit, link, done: false, notes: '', priceEst, priceFinal, order, deleted: false, updatedAt: serverTimestamp() });
   ['in-name','in-qty','in-unit','in-link','in-price-est','in-price-final'].forEach(id => {
     const el = document.getElementById(id); if (el) el.value = '';
   });
@@ -556,14 +621,41 @@ window.toggleMat = function(roomId, matId) {
   updateDoc(matDoc(roomId, matId), { done: !m.done });
 };
 
+// focusedValues stores the Firestore value at the time a field was focused,
+// so we can detect if another device changed it before we blur.
+const focusedValues = new Map(); // `${roomId}:${matId}:${field}` -> value at focus time
+
+window.matFocus = function(roomId, matId, field, currentVal) {
+  isEditing = true;
+  focusedValues.set(`${roomId}:${matId}:${field}`, currentVal);
+};
+
 window.editMat = function(roomId, matId, field, val) {
   if (!db) return;
   let parsed = val;
-  if      (field === 'qty')                            parsed = parseFloat(val) || 0;
-  else if (field === 'priceEst' || field === 'priceFinal') parsed = val !== '' ? parseFloat(val) : null;
-  else if (field === 'name')                           { parsed = val.trim(); if (!parsed) return; }
-  else if (field === 'unit' || field === 'link')       parsed = val.trim();
-  updateDoc(matDoc(roomId, matId), { [field]: parsed });
+  if      (field === 'qty')                                 parsed = parseFloat(val) || 0;
+  else if (field === 'priceEst' || field === 'priceFinal')  parsed = val !== '' ? parseFloat(val) : null;
+  else if (field === 'name')                                { parsed = val.trim(); if (!parsed) return; }
+  else if (field === 'notes' || field === 'unit' || field === 'link') parsed = val.trim ? val.trim() : val;
+  if (parsed === undefined || parsed === null && field !== 'priceEst' && field !== 'priceFinal') return;
+
+  // Conflict check for text fields
+  const key = `${roomId}:${matId}:${field}`;
+  const valueAtFocus = focusedValues.get(key);
+  focusedValues.delete(key);
+  if (valueAtFocus !== undefined) {
+    const current = getMat(roomId, matId)?.[field];
+    const serverChanged = current !== undefined && String(current) !== String(valueAtFocus);
+    const weChanged     = String(val).trim() !== String(valueAtFocus).trim();
+    if (serverChanged && weChanged) {
+      const keep = confirm(
+        `Pole "${field}" zostało zmienione przez inną osobę na:\n"${current}"\n\nTwoja wersja:\n"${val}"\n\nKliknij OK, żeby zapisać swoją wersję.`
+      );
+      if (!keep) return;
+    }
+  }
+
+  updateDoc(matDoc(roomId, matId), { [field]: parsed, updatedAt: serverTimestamp() });
 };
 
 window.delMat = function(roomId, matId) {
@@ -734,8 +826,8 @@ function init() {
 
 window.addEventListener('beforeunload', () => {
   if (unsubRooms)     unsubRooms();
-  if (unsubMaterials) unsubMaterials();
   if (unsubPhotos)    unsubPhotos();
+  unsubAllMats.forEach(u => u());
 });
 
 init();
