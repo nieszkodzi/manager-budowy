@@ -73,11 +73,3 @@ window.FIREBASE_CONFIG = {
 
 Commit and push — all visitors to the page will now share the same live data.
 
-### Notes
-
-- **Images are local only.** Firestore has a 1 MB document limit; base64 photos would exceed it. Photos you add are saved in your browser only.
-- **Test mode expires after 30 days.** Before it does, go to Firestore → Rules and set a permanent rule. For private family use:
-  ```
-  allow read, write: if true;
-  ```
-- If you need access control (login required), Firebase Authentication can be added later.
