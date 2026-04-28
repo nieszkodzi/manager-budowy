@@ -51,6 +51,15 @@ let matSortable = null;
 
 function uid() { return Math.random().toString(36).slice(2, 10); }
 function getRoom(id) { return state.rooms.find(r => r.id === id); }
+function findMat(roomId, matId) { return getRoom(roomId)?.materials.find(m => m.id === matId); }
+
+// Ensure every material and image has a stable id — called after loading from any source.
+function ensureIds() {
+  state.rooms.forEach(r => {
+    r.materials.forEach(m => { if (!m.id) m.id = uid(); });
+    r.images.forEach(img => { if (!img.id) img.id = uid(); });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Persistence — Firestore when available, localStorage as fallback
@@ -64,9 +73,11 @@ function stateForStorage() {
     rooms: state.rooms.map(r => ({
       ...r,
       images: r.images.map(img => ({
+        id: img.id,
         name: img.name,
         url: img.url,
-        path: img.path // Path in Firebase Storage to allow deletion
+        path: img.path
+        // data (local data URLs) intentionally not persisted to Firestore
       }))
     }))
   };
@@ -82,16 +93,6 @@ function save(pushToFirestore = true) {
   }
 }
 
-function loadLocalImages() {
-  // After a remote update overwrites state, restore images from localStorage
-  const local = JSON.parse(localStorage.getItem(LOCAL_KEY) || '{}');
-  if (!local.rooms) return;
-  state.rooms.forEach(r => {
-    const localRoom = local.rooms.find(lr => lr.id === r.id);
-    if (localRoom) r.images = localRoom.images || [];
-  });
-}
-
 function init() {
   const saved = localStorage.getItem(LOCAL_KEY);
   if (saved) {
@@ -101,44 +102,41 @@ function init() {
     state.activeRoom = state.rooms[0].id;
   }
   if (!state.activeRoom && state.rooms.length) state.activeRoom = state.rooms[0].id;
+  ensureIds();
 
   if (db) {
     console.log("[Firestore] attaching listener to", FIRESTORE_DOC);
     setBanner("sync", "Łączenie z Firestore…");
     unsubscribe = onSnapshot(doc(db, FIRESTORE_DOC), snapshot => {
       console.log("[Firestore] snapshot received, exists:", snapshot.exists(), "fromCache:", snapshot.metadata.fromCache);
+
+      // Skip snapshots that include our own pending writes — they will be
+      // followed by a confirmed snapshot once the write is acknowledged.
       if (snapshot.metadata.hasPendingWrites) {
         console.log("[Firestore] pending writes, skipping update");
         return;
       }
+
+      // Don't overwrite state while the user is actively editing a field.
+      // The next snapshot after their blur+save will carry their changes.
+      if (isEditing) {
+        console.log("[Firestore] user is editing, deferring remote update");
+        return;
+      }
+
       if (snapshot.exists()) {
         const remote = snapshot.data();
-        console.log("[Firestore] data received from remote");
-        
-        // Merge strategy: preserve local data if we have pending changes or newer images
-        const remoteRooms = remote.rooms || [];
-        remoteRooms.forEach(rr => {
-          const lr = state.rooms.find(l => l.id === rr.id);
-          if (!lr) return;
+        console.log("[Firestore] applying remote state");
 
-          // 1. Preserve local images if they seem more complete
-          if (lr.images?.length > (rr.images?.length || 0)) {
-            console.log(`[Firestore] preserving local images for room ${rr.id}`);
-            rr.images = lr.images;
-          }
-
-          // 2. If user is currently editing THIS room, we must be careful.
-          // For now, we allow the remote update but the UI won't re-render 
-          // the content area thanks to the isEditing check in renderContent.
-          // This allows the state to be updated in background without jumping the cursor.
-        });
-
-        state.rooms = remoteRooms;
+        // Firestore is the single source of truth. We do NOT re-add locally
+        // cached images: doing so would resurrect images deleted on other tabs.
+        state.rooms = remote.rooms || [];
+        ensureIds(); // assign ids to any items created before this fix
         // Do not update state.activeRoom from remote to allow independent navigation
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
         setBanner("sync", "Zsynchronizowano", 2000);
       } else {
-        // First time OR document deleted — push local state to Firestore if it has data
+        // Document deleted or first run — push local state to Firestore if it has data
         console.log("[Firestore] document does not exist");
         if (state.rooms.length > 0) {
           console.log("[Firestore] pushing local state to new document");
@@ -150,7 +148,6 @@ function init() {
     }, err => {
       console.error("Firestore listen failed:", err);
       setBanner("error", "Błąd połączenia: " + (err.code || err.message));
-      // Fallback to local if permission denied
       if (err.code === 'permission-denied') {
         console.warn("[Firestore] access denied - check Security Rules");
       }
@@ -161,6 +158,8 @@ function init() {
 
   render();
 }
+
+window.addEventListener('beforeunload', () => { if (unsubscribe) unsubscribe(); });
 
 // ---------------------------------------------------------------------------
 // Sync banner
@@ -191,10 +190,10 @@ function setBanner(type, text, autoClearMs = 0) {
 // Render
 // ---------------------------------------------------------------------------
 
-function render(pushToFirestore = true) { 
-  renderSidebar(); 
-  renderContent(); 
-  save(pushToFirestore); 
+function render(pushToFirestore = true) {
+  renderSidebar();
+  renderContent();
+  save(pushToFirestore);
 }
 
 function renderSidebar() {
@@ -245,7 +244,7 @@ function renderContent() {
   const el = document.getElementById('content');
   const room = getRoom(state.activeRoom);
   if (!room) { el.innerHTML = '<div class="empty-state">Wybierz pomieszczenie</div>'; return; }
-  
+
   // If user is currently typing, don't re-render the content area to avoid losing focus/cursor position.
   // We'll rely on the blur events to update the state and trigger a proper render if needed.
   if (isEditing && document.activeElement && el.contains(document.activeElement)) {
@@ -255,40 +254,44 @@ function renderContent() {
   const total = room.materials.length, done = room.materials.filter(m => m.done).length;
   const pct = total ? Math.round(done / total * 100) : 0;
 
-  const imgGrid = room.images.map((img, i) => `
-    <div class="img-thumb" onclick="openImage('${img.url || img.data}')">
-      <img src="${img.url || img.data}" alt="wizualizacja">
-      <button class="img-del" onclick="event.stopPropagation();delImg('${room.id}',${i})">✕</button>
-    </div>`).join('');
+  // Use img.id for deletion — never array index, which can shift after remote sync.
+  const imgGrid = room.images.map(img => {
+    const src = escHtml(img.url || img.data || '');
+    return `<div class="img-thumb" onclick="openImage('${src}')">
+      <img src="${src}" alt="wizualizacja">
+      <button class="img-del" onclick="event.stopPropagation();delImg('${room.id}','${img.id}')">✕</button>
+    </div>`;
+  }).join('');
 
-  const matRows = room.materials.map((m, i) => `
-    <div class="mat-row ${m.done ? 'done-row' : ''}" data-idx="${i}">
+  // Use m.id for all operations — never array index, which can shift after remote sync.
+  const matRows = room.materials.map(m => `
+    <div class="mat-row ${m.done ? 'done-row' : ''}" data-id="${m.id}">
       <div class="drag-handle">⋮⋮</div>
-      <input type="checkbox" class="mat-check" ${m.done ? 'checked' : ''} onchange="toggleMat('${room.id}',${i})">
+      <input type="checkbox" class="mat-check" ${m.done ? 'checked' : ''} onchange="toggleMat('${room.id}','${m.id}')">
       <div class="mat-name-cell">
-        <div class="mat-name" contenteditable="true" onfocus="setEditing(true)" onblur="setEditing(false);editMat('${room.id}',${i},'name',this.innerText)">${escHtml(m.name)}</div>
-        <textarea class="mat-notes" placeholder="Notatki..." 
-          onfocus="setEditing(true)" 
+        <div class="mat-name" contenteditable="true" onfocus="setEditing(true)" onblur="setEditing(false);editMat('${room.id}','${m.id}','name',this.innerText)">${escHtml(m.name)}</div>
+        <textarea class="mat-notes" placeholder="Notatki..."
+          onfocus="setEditing(true)"
           oninput="autoResize(this)"
-          onblur="setEditing(false);editMat('${room.id}',${i},'notes',this.value)">${escHtml(m.notes || '')}</textarea>
+          onblur="setEditing(false);editMat('${room.id}','${m.id}','notes',this.value)">${escHtml(m.notes || '')}</textarea>
       </div>
       <div class="mat-qty">
         <input type="number" value="${m.qty}" min="0" step="0.1"
           style="width:60px;font-size:13px;padding:3px 6px;border-radius:6px;border:0.5px solid #ddd;text-align:center"
-          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}',${i},'qty',this.value)">
+          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}','${m.id}','qty',this.value)">
       </div>
       <div class="mat-unit">
         <input type="text" value="${escHtml(m.unit || 'szt.')}"
           style="width:54px;font-size:12px;padding:3px 6px;border-radius:6px;border:0.5px solid #ddd;text-align:center;color:#888"
-          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}',${i},'unit',this.value)">
+          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}','${m.id}','unit',this.value)">
       </div>
       <div class="mat-link">
         <input type="url" value="${escHtml(m.link || '')}" placeholder="https://..."
           style="width:120px;font-size:12px;padding:3px 6px;border-radius:6px;border:0.5px solid #ddd"
-          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}',${i},'link',this.value)">
+          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}','${m.id}','link',this.value)">
         ${m.link ? `<br><a href="${escHtml(m.link)}" target="_blank" rel="noopener">↗ otwórz</a>` : ''}
       </div>
-      <div class="mat-del"><button onclick="delMat('${room.id}',${i})" title="Usuń">×</button></div>
+      <div class="mat-del"><button onclick="delMat('${room.id}','${m.id}')" title="Usuń">×</button></div>
     </div>`).join('');
 
   el.innerHTML = `
@@ -305,8 +308,8 @@ function renderContent() {
       </div>
     </div>
     <div class="room-notes-section">
-      <textarea class="room-notes" placeholder="Notatki do pomieszczenia..." 
-        onfocus="setEditing(true)" 
+      <textarea class="room-notes" placeholder="Notatki do pomieszczenia..."
+        onfocus="setEditing(true)"
         oninput="autoResize(this)"
         onblur="setEditing(false);renameRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
     </div>
@@ -344,7 +347,7 @@ function renderContent() {
       </div>
     </div>`;
   initMatSortable(room.id);
-  
+
   // Auto-resize all textareas after render
   el.querySelectorAll('textarea').forEach(autoResize);
 }
@@ -377,9 +380,9 @@ function initMatSortable(roomId) {
 
 function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 
-window.selectRoom = function(id) { 
+window.selectRoom = function(id) {
   if (state.activeRoom === id) return;
-  state.activeRoom = id; 
+  state.activeRoom = id;
   render(false); // No need to push state just because we changed local tab
   window.toggleSidebar(false);
 };
@@ -426,19 +429,27 @@ window.addMat = function(roomId) {
   document.getElementById('in-name')?.focus();
 };
 
-window.toggleMat = function(roomId, idx) { getRoom(roomId).materials[idx].done = !getRoom(roomId).materials[idx].done; render(); };
+window.toggleMat = function(roomId, matId) {
+  const m = findMat(roomId, matId);
+  if (!m) return;
+  m.done = !m.done;
+  render();
+};
 
-window.editMat = function(roomId, idx, field, val) {
-  const r = getRoom(roomId);
-  r.materials[idx][field] = field === 'qty' ? (parseFloat(val) || 0) : val.trim();
+window.editMat = function(roomId, matId, field, val) {
+  const m = findMat(roomId, matId);
+  if (!m) return;
+  m[field] = field === 'qty' ? (parseFloat(val) || 0) : val.trim();
   render(true);
 };
 
-window.delMat = function(roomId, idx) {
+window.delMat = function(roomId, matId) {
   const r = getRoom(roomId);
-  const m = r.materials[idx];
+  if (!r) return;
+  const m = r.materials.find(mat => mat.id === matId);
+  if (!m) return;
   if (!confirm(`Czy na pewno chcesz usunąć materiał: "${m.name}"?`)) return;
-  r.materials.splice(idx, 1);
+  r.materials = r.materials.filter(mat => mat.id !== matId);
   render();
 };
 
@@ -450,7 +461,7 @@ window.addImages = function(roomId, evt) {
     [...evt.target.files].forEach(f => {
       const fr = new FileReader();
       fr.onload = e => {
-        r.images.push({ data: e.target.result, name: f.name });
+        r.images.push({ id: uid(), data: e.target.result, name: f.name });
         render();
       };
       fr.readAsDataURL(f);
@@ -463,7 +474,7 @@ window.addImages = function(roomId, evt) {
 
   setBanner("sync", `Przesyłanie ${files.length} zdjęć…`);
   console.log(`[Storage] Starting upload of ${files.length} files for room ${roomId}`);
-  
+
   let successCount = 0;
   let failCount = 0;
 
@@ -471,18 +482,18 @@ window.addImages = function(roomId, evt) {
     const fileId = uid();
     const path = `rooms/${roomId}/${fileId}_${f.name}`;
     const storageRef = ref(storage, path);
-    
+
     try {
       console.log(`[Storage] Uploading ${f.name} to ${path}...`);
       const snapshot = await uploadBytes(storageRef, f);
       console.log(`[Storage] Upload successful for ${f.name}`);
       const url = await getDownloadURL(snapshot.ref);
       console.log(`[Storage] URL obtained: ${url}`);
-      
-      // Get FRESH room reference to avoid race conditions with sync
+
+      // Get FRESH room reference — state may have been updated by a snapshot during upload
       const r = getRoom(roomId);
       if (r) {
-        r.images.push({ url, path, name: f.name });
+        r.images.push({ id: uid(), url, path, name: f.name });
         successCount++;
       } else {
         console.error(`[Storage] Room ${roomId} not found after upload!`);
@@ -507,18 +518,21 @@ window.addImages = function(roomId, evt) {
   });
 };
 
-window.delImg = function(roomId, idx) {
+window.delImg = function(roomId, imgId) {
   if (!confirm('Czy na pewno chcesz usunąć to zdjęcie?')) return;
   const r = getRoom(roomId);
+  if (!r) return;
+  const idx = r.images.findIndex(img => img.id === imgId);
+  if (idx === -1) return;
   const img = r.images[idx];
-  
+
   if (img.path && storage) {
     const storageRef = ref(storage, img.path);
     deleteObject(storageRef).catch(err => {
       console.warn("Could not delete file from storage:", err);
     });
   }
-  
+
   r.images.splice(idx, 1);
   render(true);
 };
@@ -548,6 +562,7 @@ window.importJSON = function(evt) {
     try {
       state = JSON.parse(e.target.result);
       if (!state.activeRoom && state.rooms.length) state.activeRoom = state.rooms[0].id;
+      ensureIds();
       render();
     } catch (err) { alert('Błąd pliku — upewnij się, że to prawidłowy plik JSON z tej aplikacji.'); }
   };
