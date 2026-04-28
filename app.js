@@ -263,6 +263,8 @@ function renderContent() {
   }
   const total = room.materials.length, done = room.materials.filter(m => m.done).length;
   const pct = total ? Math.round(done / total * 100) : 0;
+  const estTotal = room.materials.reduce((s, m) => s + (parseFloat(m.priceEst) || 0), 0);
+  const finalTotal = room.materials.reduce((s, m) => s + (parseFloat(m.priceFinal) || 0), 0);
 
   // Use img.id for deletion — never array index, which can shift after remote sync.
   const imgGrid = room.images.map(img => {
@@ -301,6 +303,16 @@ function renderContent() {
           onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}','${m.id}','link',this.value)">
         ${m.link ? `<br><a href="${escHtml(m.link)}" target="_blank" rel="noopener">↗ otwórz</a>` : ''}
       </div>
+      <div class="mat-price-est">
+        <input type="number" value="${m.priceEst ?? ''}" min="0" step="0.01" placeholder="—"
+          style="width:80px;font-size:13px;padding:3px 6px;border-radius:6px;border:0.5px solid #ddd;text-align:right"
+          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}','${m.id}','priceEst',this.value)">
+      </div>
+      <div class="mat-price-final">
+        <input type="number" value="${m.priceFinal ?? ''}" min="0" step="0.01" placeholder="—"
+          style="width:80px;font-size:13px;padding:3px 6px;border-radius:6px;border:0.5px solid #ddd;text-align:right"
+          onfocus="setEditing(true)" onblur="setEditing(false)" onchange="editMat('${room.id}','${m.id}','priceFinal',this.value)">
+      </div>
       <div class="mat-del"><button onclick="delMat('${room.id}','${m.id}')" title="Usuń">×</button></div>
     </div>`).join('');
 
@@ -328,6 +340,8 @@ function renderContent() {
       <div class="sum-card"><div class="sum-label">Kupione</div><div class="sum-val" style="color:#3B6D11">${done}</div></div>
       <div class="sum-card"><div class="sum-label">Do kupienia</div><div class="sum-val" style="color:#BA7517">${total - done}</div></div>
       <div class="sum-card"><div class="sum-label">Postęp</div><div class="sum-val">${pct}%</div></div>
+      ${estTotal > 0 ? `<div class="sum-card"><div class="sum-label">Szacunkowy koszt</div><div class="sum-val" style="font-size:1rem">${formatPrice(estTotal)}</div></div>` : ''}
+      ${finalTotal > 0 ? `<div class="sum-card"><div class="sum-label">Koszt końcowy</div><div class="sum-val" style="font-size:1rem;color:#3B6D11">${formatPrice(finalTotal)}</div></div>` : ''}
     </div>
     ${room.images.length ? `<div class="img-section"><div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div></div>` : ''}
     <div class="materials-section">
@@ -338,6 +352,8 @@ function renderContent() {
         <div style="width:70px;text-align:center">Ilość</div>
         <div style="width:60px;text-align:center">Jednostka</div>
         <div style="width:140px">Link</div>
+        <div style="width:88px;text-align:right">Cena szac.</div>
+        <div style="width:88px;text-align:right">Cena końc.</div>
         <div style="width:56px"></div>
       </div>
       <div id="mat-list">
@@ -352,6 +368,10 @@ function renderContent() {
         <input class="in-unit" id="in-unit" placeholder="szt."
           onfocus="setEditing(true)" onblur="setEditing(false)">
         <input class="in-link" type="url" id="in-link" placeholder="https://... (opcjonalnie)"
+          onfocus="setEditing(true)" onblur="setEditing(false)">
+        <input class="in-price-est" type="number" id="in-price-est" placeholder="Cena szac." min="0" step="0.01"
+          onfocus="setEditing(true)" onblur="setEditing(false)">
+        <input class="in-price-final" type="number" id="in-price-final" placeholder="Cena końc." min="0" step="0.01"
           onfocus="setEditing(true)" onblur="setEditing(false)">
         <button class="btn primary" onclick="addMat('${room.id}')">Dodaj</button>
       </div>
@@ -389,6 +409,11 @@ function initMatSortable(roomId) {
 // ---------------------------------------------------------------------------
 
 function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+
+function formatPrice(val) {
+  if (val == null || val === '') return '—';
+  return Number(val).toLocaleString('pl-PL', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) + ' zł';
+}
 
 window.selectRoom = function(id) {
   if (state.activeRoom === id) return;
@@ -434,7 +459,11 @@ window.addMat = function(roomId) {
   const qty = parseFloat(document.getElementById('in-qty').value) || 1;
   const unit = document.getElementById('in-unit').value.trim() || 'szt.';
   const link = document.getElementById('in-link').value.trim();
-  getRoom(roomId).materials.push({ id: uid(), name, qty, unit, link, done: false, notes: '' });
+  const priceEstRaw = document.getElementById('in-price-est').value;
+  const priceFinalRaw = document.getElementById('in-price-final').value;
+  const priceEst = priceEstRaw !== '' ? parseFloat(priceEstRaw) : null;
+  const priceFinal = priceFinalRaw !== '' ? parseFloat(priceFinalRaw) : null;
+  getRoom(roomId).materials.push({ id: uid(), name, qty, unit, link, done: false, notes: '', priceEst, priceFinal });
   render(true);
   document.getElementById('in-name')?.focus();
 };
@@ -449,7 +478,13 @@ window.toggleMat = function(roomId, matId) {
 window.editMat = function(roomId, matId, field, val) {
   const m = findMat(roomId, matId);
   if (!m) return;
-  m[field] = field === 'qty' ? (parseFloat(val) || 0) : val.trim();
+  if (field === 'qty') {
+    m[field] = parseFloat(val) || 0;
+  } else if (field === 'priceEst' || field === 'priceFinal') {
+    m[field] = val !== '' ? parseFloat(val) : null;
+  } else {
+    m[field] = val.trim();
+  }
   // Save without re-rendering — the user just blurred, the DOM already reflects
   // what they typed. A full render here would rebuild the DOM mid-interaction.
   save(true);

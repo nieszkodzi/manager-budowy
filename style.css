@@ -55,6 +55,8 @@ header{background:#fff;border-bottom:0.5px solid #ddd;padding:1rem 2rem;display:
 .mat-link{width:130px;font-size:12px}
 .mat-link a{color:#185FA5;text-decoration:none}
 .mat-link a:hover{text-decoration:underline}
+.mat-price-est{width:88px;text-align:right;font-size:13px}
+.mat-price-final{width:88px;text-align:right;font-size:13px}
 .mat-del{width:28px;text-align:center}
 .mat-del button{background:none;border:none;color:#ccc;cursor:pointer;font-size:15px;padding:0;line-height:1}
 .mat-del button:hover{color:#a32d2d}
@@ -65,6 +67,8 @@ header{background:#fff;border-bottom:0.5px solid #ddd;padding:1rem 2rem;display:
 .in-qty{width:70px}
 .in-unit{width:70px}
 .in-link{flex:1.5;min-width:100px}
+.in-price-est{width:90px}
+.in-price-final{width:90px}
 .summary-bar{display:flex;gap:16px;margin-bottom:1.5rem;flex-wrap:wrap}
 .sum-card{background:#fff;border:0.5px solid #ddd;border-radius:10px;padding:12px 16px;min-width:100px;flex:1}
 .sum-label{font-size:11px;color:#888;margin-bottom:4px}
@@ -114,10 +118,12 @@ input[type=file]{display:none}
   .mat-name-cell{width:100%;margin-bottom:8px}
   .mat-name{font-weight:600}
   .mat-row > .drag-handle{position:absolute;top:10px;left:8px}
-  .mat-qty, .mat-unit, .mat-link{width:100%!important;text-align:left!important;display:flex;align-items:center;gap:8px}
-  .mat-qty::before{content:'Ilość:';font-size:11px;color:#888;width:60px}
-  .mat-unit::before{content:'Jedn:';font-size:11px;color:#888;width:60px}
-  .mat-link::before{content:'Link:';font-size:11px;color:#888;width:60px}
+  .mat-qty, .mat-unit, .mat-link, .mat-price-est, .mat-price-final{width:100%!important;text-align:left!important;display:flex;align-items:center;gap:8px}
+  .mat-qty::before{content:'Ilość:';font-size:11px;color:#888;width:80px}
+  .mat-unit::before{content:'Jedn:';font-size:11px;color:#888;width:80px}
+  .mat-link::before{content:'Link:';font-size:11px;color:#888;width:80px}
+  .mat-price-est::before{content:'Cena szac.:';font-size:11px;color:#888;width:80px}
+  .mat-price-final::before{content:'Cena końc.:';font-size:11px;color:#888;width:80px}
   .mat-link br{display:none}
   .mat-del{position:absolute;bottom:8px;right:14px;width:auto}
   .mat-check{position:absolute;top:10px;right:14px}
