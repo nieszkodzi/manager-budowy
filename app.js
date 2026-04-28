@@ -1,6 +1,10 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js";
-import { getFirestore, doc, onSnapshot, setDoc } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js";
-import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-storage.js";
+import {
+  initializeFirestore, persistentLocalCache,
+  collection, doc, addDoc, setDoc, updateDoc,
+  onSnapshot, writeBatch
+} from "https://www.gstatic.com/firebasejs/11.6.0/firebase-firestore.js";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-storage.js";
 
 // ---------------------------------------------------------------------------
 // Firebase setup
@@ -9,46 +13,37 @@ import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "http
 const cfg = window.FIREBASE_CONFIG || {};
 const firebaseReady = cfg.apiKey && !cfg.apiKey.startsWith("YOUR_");
 
-console.log("[Firebase] config loaded:", !!window.FIREBASE_CONFIG);
-console.log("[Firebase] firebaseReady:", firebaseReady);
-if (window.FIREBASE_CONFIG) {
-  console.log("[Firebase] projectId:", window.FIREBASE_CONFIG.projectId);
-  console.log("[Firebase] apiKey starts with:", window.FIREBASE_CONFIG.apiKey?.slice(0, 8));
-}
-
 let db = null;
 let storage = null;
-let unsubscribe = null;
-let pendingSaveCount = 0;
-let saveDebounceTimer = null;
-
-function debouncedSave() {
-  clearTimeout(saveDebounceTimer);
-  saveDebounceTimer = setTimeout(() => save(true), 600);
-}
-
-// Cancel any pending debounce and save immediately — called on textarea blur
-// so notes are in Firestore (pendingSaveCount > 0) before any snapshot can arrive.
-window.flushSave = function() {
-  clearTimeout(saveDebounceTimer);
-  save(true);
-};
 
 if (firebaseReady) {
   try {
     const app = initializeApp(cfg);
-    db = getFirestore(app);
+    db = initializeFirestore(app, { localCache: persistentLocalCache() });
     storage = getStorage(app);
     console.log("[Firebase] initialized OK");
   } catch (e) {
     console.error("[Firebase] init error:", e);
   }
-} else {
-  console.warn("[Firebase] skipping init — config missing or placeholder");
 }
 
 // ---------------------------------------------------------------------------
-// State
+// Firestore path helpers
+//   projects/shared/rooms/{roomId}
+//   projects/shared/rooms/{roomId}/materials/{matId}
+//   projects/shared/rooms/{roomId}/photos/{photoId}
+// ---------------------------------------------------------------------------
+
+const PROJECT = "shared";
+const roomsCol  = ()           => collection(db, "projects", PROJECT, "rooms");
+const roomDoc   = (id)         => doc(db, "projects", PROJECT, "rooms", id);
+const matsCol   = (rId)        => collection(db, "projects", PROJECT, "rooms", rId, "materials");
+const matDoc    = (rId, mId)   => doc(db, "projects", PROJECT, "rooms", rId, "materials", mId);
+const photosCol = (rId)        => collection(db, "projects", PROJECT, "rooms", rId, "photos");
+const photoDoc  = (rId, pId)   => doc(db, "projects", PROJECT, "rooms", rId, "photos", pId);
+
+// ---------------------------------------------------------------------------
+// In-memory state  (rebuilt from Firestore snapshots — never written directly)
 // ---------------------------------------------------------------------------
 
 const ROOMS_DEFAULT = [
@@ -58,135 +53,104 @@ const ROOMS_DEFAULT = [
   "Strych","Łazienka na strychu"
 ];
 
-let state = { rooms: [], activeRoom: null };
-let modalCb = null;
-let roomSortable = null;
-let matSortable = null;
+const roomsMap    = new Map(); // roomId  -> room object
+const matsMap     = new Map(); // roomId  -> Map(matId   -> material)
+const photosMap   = new Map(); // roomId  -> Map(photoId -> photo)
 
-function uid() { return Math.random().toString(36).slice(2, 10); }
-function getRoom(id) { return state.rooms.find(r => r.id === id); }
-function findMat(roomId, matId) { return getRoom(roomId)?.materials.find(m => m.id === matId); }
+let activeRoomId    = localStorage.getItem('activeRoom') || null;
+let subscribedRoomId = null;
 
-// Back-fill stable ids and deleted:false on items that predate this feature.
-function ensureIds() {
-  state.rooms.forEach(r => {
-    if (!r.id) r.id = uid();
-    if (r.deleted === undefined) r.deleted = false;
-    r.materials.forEach(m => {
-      if (!m.id) m.id = uid();
-      if (m.deleted === undefined) m.deleted = false;
-    });
-    r.images.forEach(img => {
-      if (!img.id) img.id = uid();
-      if (img.deleted === undefined) img.deleted = false;
-    });
+let unsubRooms     = null;
+let unsubMaterials = null;
+let unsubPhotos    = null;
+let roomSortable   = null;
+let matSortable    = null;
+let modalCb        = null;
+let isEditing      = false;
+
+// ---------------------------------------------------------------------------
+// Derived helpers
+// ---------------------------------------------------------------------------
+
+const byOrder    = (a, b) => (a.order || 0) - (b.order || 0);
+const sortedVals = map    => [...(map?.values() || [])].sort(byOrder);
+
+function liveRooms()          { return sortedVals(roomsMap).filter(r => !r.deleted); }
+function allRooms()           { return sortedVals(roomsMap); }
+function liveMats(roomId)     { return sortedVals(matsMap.get(roomId)).filter(m => !m.deleted); }
+function allMats(roomId)      { return sortedVals(matsMap.get(roomId)); }
+function livePhotos(roomId)   { return sortedVals(photosMap.get(roomId)).filter(p => !p.deleted); }
+function allPhotos(roomId)    { return sortedVals(photosMap.get(roomId)); }
+function getRoom(id)          { return roomsMap.get(id); }
+function getMat(rId, mId)     { return matsMap.get(rId)?.get(mId); }
+function getPhoto(rId, pId)   { return photosMap.get(rId)?.get(pId); }
+function nextOrder(items)     { return items.length ? Math.max(...items.map(i => i.order || 0)) + 1000 : 0; }
+
+// ---------------------------------------------------------------------------
+// Firestore listeners
+// ---------------------------------------------------------------------------
+
+function subscribeToRooms() {
+  if (!db) return;
+  unsubRooms = onSnapshot(roomsCol(), snap => {
+    snap.forEach(d => roomsMap.set(d.id, { id: d.id, ...d.data() }));
+    snap.docChanges().forEach(ch => { if (ch.type === 'removed') roomsMap.delete(ch.doc.id); });
+
+    // Seed default rooms on very first load (empty server collection)
+    if (snap.empty && !snap.metadata.fromCache) {
+      seedDefaultRooms();
+      return;
+    }
+
+    // Fix activeRoomId if the room was deleted or never existed
+    if (!activeRoomId || !roomsMap.has(activeRoomId) || getRoom(activeRoomId)?.deleted) {
+      const first = liveRooms()[0];
+      activeRoomId = first?.id || null;
+      activeRoomId ? localStorage.setItem('activeRoom', activeRoomId)
+                   : localStorage.removeItem('activeRoom');
+    }
+
+    subscribeToRoom(activeRoomId);
+    renderSidebar();
+  }, err => {
+    console.error("[Firestore] rooms:", err);
+    setBanner("error", "Błąd połączenia: " + (err.code || err.message));
   });
 }
 
-// ---------------------------------------------------------------------------
-// Persistence
-// ---------------------------------------------------------------------------
+function subscribeToRoom(roomId) {
+  if (subscribedRoomId === roomId) return;
+  subscribedRoomId = roomId;
+  if (unsubMaterials) { unsubMaterials(); unsubMaterials = null; }
+  if (unsubPhotos)    { unsubPhotos();    unsubPhotos    = null; }
 
-const LOCAL_KEY = 'remont_v2';
-const FIRESTORE_DOC = 'shared/state';
+  if (!roomId || !db) { renderContent(); return; }
 
-function stateForStorage() {
-  return {
-    updatedAt: state.updatedAt || 0,
-    rooms: state.rooms.map(r => ({
-      ...r,
-      images: r.images.map(img => ({
-        id: img.id,
-        name: img.name,
-        url: img.url,
-        path: img.path,
-        deleted: img.deleted,
-        description: img.description
-      }))
-    }))
-  };
+  unsubMaterials = onSnapshot(matsCol(roomId), snap => {
+    if (!matsMap.has(roomId)) matsMap.set(roomId, new Map());
+    const m = matsMap.get(roomId);
+    snap.forEach(d => m.set(d.id, { id: d.id, ...d.data() }));
+    snap.docChanges().forEach(ch => { if (ch.type === 'removed') m.delete(ch.doc.id); });
+    renderContent();
+  }, err => console.error("[Firestore] materials:", err));
+
+  unsubPhotos = onSnapshot(photosCol(roomId), snap => {
+    if (!photosMap.has(roomId)) photosMap.set(roomId, new Map());
+    const p = photosMap.get(roomId);
+    snap.forEach(d => p.set(d.id, { id: d.id, ...d.data() }));
+    snap.docChanges().forEach(ch => { if (ch.type === 'removed') p.delete(ch.doc.id); });
+    renderContent();
+  }, err => console.error("[Firestore] photos:", err));
 }
 
-function save(pushToFirestore = true) {
-  if (pushToFirestore) state.updatedAt = Date.now();
-  localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
-  if (db && pushToFirestore) {
-    pendingSaveCount++;
-    setDoc(doc(db, FIRESTORE_DOC), stateForStorage())
-      .then(() => { pendingSaveCount = Math.max(0, pendingSaveCount - 1); })
-      .catch(err => {
-        pendingSaveCount = Math.max(0, pendingSaveCount - 1);
-        console.error("Firestore write failed:", err);
-        setBanner("error", "Błąd zapisu: " + (err.code || err.message));
-      });
-  }
+async function seedDefaultRooms() {
+  console.log("[Firestore] seeding default rooms");
+  const batch = writeBatch(db);
+  ROOMS_DEFAULT.forEach((name, i) => {
+    batch.set(doc(roomsCol()), { name, notes: '', order: i * 1000, deleted: false });
+  });
+  await batch.commit();
 }
-
-function init() {
-  const saved = localStorage.getItem(LOCAL_KEY);
-  if (saved) {
-    try { state = JSON.parse(saved); } catch (e) {}
-  } else {
-    state.rooms = ROOMS_DEFAULT.map(n => ({ id: uid(), name: n, images: [], materials: [], deleted: false }));
-    state.activeRoom = state.rooms[0].id;
-  }
-  if (!state.activeRoom && state.rooms.length) state.activeRoom = state.rooms[0].id;
-  ensureIds();
-
-  if (db) {
-    console.log("[Firestore] attaching listener to", FIRESTORE_DOC);
-    setBanner("sync", "Łączenie z Firestore…");
-    unsubscribe = onSnapshot(doc(db, FIRESTORE_DOC), snapshot => {
-      console.log("[Firestore] snapshot received, exists:", snapshot.exists(), "fromCache:", snapshot.metadata.fromCache);
-
-      if (snapshot.metadata.hasPendingWrites) {
-        console.log("[Firestore] pending writes, skipping update");
-        return;
-      }
-      if (pendingSaveCount > 0) {
-        console.log("[Firestore] save in flight, skipping remote update");
-        return;
-      }
-      if (isEditing) {
-        console.log("[Firestore] user is editing, deferring remote update");
-        return;
-      }
-
-      if (snapshot.exists()) {
-        const remote = snapshot.data();
-        const remoteTs = remote.updatedAt || 0;
-        const localTs = state.updatedAt || 0;
-        if (remoteTs <= localTs) {
-          console.log("[Firestore] remote is not newer (remote:", remoteTs, "local:", localTs, "), ignoring");
-          return;
-        }
-        console.log("[Firestore] applying remote state (remote:", remoteTs, "local:", localTs, ")");
-        state.rooms = remote.rooms || [];
-        state.updatedAt = remoteTs;
-        ensureIds();
-        localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
-        setBanner("sync", "Zsynchronizowano", 2000);
-      } else {
-        console.log("[Firestore] document does not exist — waiting for first user action to create it");
-        setBanner("sync", "Gotowy", 2000);
-        return;
-      }
-      render(false);
-    }, err => {
-      console.error("Firestore listen failed:", err);
-      setBanner("error", "Błąd połączenia: " + (err.code || err.message));
-      if (err.code === 'permission-denied') {
-        console.warn("[Firestore] access denied - check Security Rules");
-      }
-    });
-  } else {
-    setBanner("local", "Tryb lokalny (bez synchronizacji)");
-  }
-
-  render(false);
-}
-
-window.addEventListener('beforeunload', () => { if (unsubscribe) unsubscribe(); });
 
 // ---------------------------------------------------------------------------
 // Sync banner
@@ -200,38 +164,35 @@ function setBanner(type, text, autoClearMs = 0) {
     el.style.cssText = 'position:fixed;bottom:12px;right:16px;font-size:12px;padding:5px 12px;border-radius:20px;z-index:200;transition:opacity 0.4s';
     document.body.appendChild(el);
   }
-  const styles = {
-    sync:  'background:#eaf3de;color:#3B6D11',
-    error: 'background:#fcebeb;color:#a32d2d',
-    local: 'background:#f5f4f0;color:#888'
-  };
+  const styles = { sync: 'background:#eaf3de;color:#3B6D11', error: 'background:#fcebeb;color:#a32d2d', local: 'background:#f5f4f0;color:#888' };
   el.style.cssText += ';' + (styles[type] || styles.local);
   el.style.opacity = '1';
   el.textContent = text;
-  if (autoClearMs) {
-    setTimeout(() => { el.style.opacity = '0'; }, autoClearMs);
-  }
+  if (autoClearMs) setTimeout(() => { el.style.opacity = '0'; }, autoClearMs);
 }
 
 // ---------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------
 
-function render(pushToFirestore = true) {
-  renderSidebar();
-  renderContent();
-  save(pushToFirestore);
+window.setEditing  = val => { isEditing = val; };
+window.autoResize  = el  => { if (!el) return; el.style.height = 'auto'; el.style.height = el.scrollHeight + 'px'; };
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function formatPrice(val) {
+  if (val == null || val === '') return '—';
+  return Number(val).toLocaleString('pl-PL', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) + ' zł';
 }
 
 function renderSidebar() {
   const el = document.getElementById('room-list');
-  const liveRooms = state.rooms.filter(r => !r.deleted);
-  el.innerHTML = liveRooms.map(r => {
-    const liveMats = r.materials.filter(m => !m.deleted);
-    const total = liveMats.length, done = liveMats.filter(m => m.done).length;
+  el.innerHTML = liveRooms().map(r => {
+    const mats = liveMats(r.id);
+    const total = mats.length, done = mats.filter(m => m.done).length;
     const cls = total === 0 ? 'empty' : done === total ? 'done' : 'partial';
-    const active = r.id === state.activeRoom ? 'active' : '';
-    return `<div class="room-item ${active}" data-id="${r.id}">
+    return `<div class="room-item ${r.id === activeRoomId ? 'active' : ''}" data-id="${r.id}">
       <div class="drag-handle">⋮⋮</div>
       <div class="room-click-area" onclick="selectRoom('${r.id}')">
         <div class="room-dot ${cls}"></div><span>${escHtml(r.name)}</span>
@@ -239,85 +200,35 @@ function renderSidebar() {
     </div>`;
   }).join('');
 
-  // Trash entry at the bottom — only if there's anything deleted
-  const hasDeletedRooms = state.rooms.some(r => r.deleted);
-  const hasDeletedContent = state.rooms.some(r =>
-    r.materials.some(m => m.deleted) || r.images.some(img => img.deleted)
+  const hasDeletedRooms   = allRooms().some(r => r.deleted);
+  const hasDeletedContent = [...roomsMap.keys()].some(rId =>
+    allMats(rId).some(m => m.deleted) || allPhotos(rId).some(p => p.deleted)
   );
   if (hasDeletedRooms || hasDeletedContent) {
     el.innerHTML += `<div class="room-item trash-item" onclick="openTrash()">
       <div style="width:24px"></div>
-      <div class="room-click-area" style="color:#aaa;font-size:12px">
-        <span>🗑 Kosz</span>
-      </div>
+      <div class="room-click-area" style="color:#aaa;font-size:12px"><span>🗑 Kosz</span></div>
     </div>`;
   }
 
   initRoomSortable();
 }
 
-function initRoomSortable() {
-  const el = document.getElementById('room-list');
-  if (!el) return;
-  if (roomSortable) {
-    try { roomSortable.destroy(); } catch (e) {}
-    roomSortable = null;
-  }
-  roomSortable = Sortable.create(el, {
-    animation: 150,
-    handle: '.drag-handle',
-    ghostClass: 'sortable-ghost',
-    filter: '.trash-item',
-    onEnd: (evt) => {
-      // Sortable operates on the visible (live) room list only.
-      // Map DOM indices back to the full state.rooms array.
-      const liveRooms = state.rooms.filter(r => !r.deleted);
-      const movedRoom = liveRooms[evt.oldIndex];
-      if (!movedRoom) return;
-      // Re-order within the live subset, then rebuild state.rooms preserving deleted rooms at their positions.
-      const reordered = [...liveRooms];
-      const [moved] = reordered.splice(evt.oldIndex, 1);
-      reordered.splice(evt.newIndex, 0, moved);
-      // Reconstruct full array: replace live slots with reordered, keep deleted in place.
-      let liveIdx = 0;
-      state.rooms = state.rooms.map(r => r.deleted ? r : reordered[liveIdx++]);
-      save(true);
-    }
-  });
-}
-
-let isEditing = false;
-window.setEditing = function(val) { isEditing = val; };
-function setEditing(val) { isEditing = val; }
-
-window.autoResize = function(el) {
-  if (!el) return;
-  el.style.height = 'auto';
-  el.style.height = el.scrollHeight + 'px';
-};
-function autoResize(el) { window.autoResize(el); }
-
-window.save = save;
-
 function renderContent() {
   const el = document.getElementById('content');
-  const room = getRoom(state.activeRoom);
+  const room = getRoom(activeRoomId);
   if (!room || room.deleted) { el.innerHTML = '<div class="empty-state">Wybierz pomieszczenie</div>'; return; }
+  if (isEditing && document.activeElement && el.contains(document.activeElement)) return;
 
-  if (isEditing && document.activeElement && el.contains(document.activeElement)) {
-    console.log("[Render] skipping content render due to active editing");
-    return;
-  }
+  const mats  = liveMats(room.id);
+  const imgs  = livePhotos(room.id);
+  const total = mats.length, done = mats.filter(m => m.done).length;
+  const pct   = total ? Math.round(done / total * 100) : 0;
+  const estTotal   = mats.reduce((s, m) => s + (parseFloat(m.priceEst)   || 0), 0);
+  const finalTotal = mats.reduce((s, m) => s + (parseFloat(m.priceFinal) || 0), 0);
 
-  const liveMats = room.materials.filter(m => !m.deleted);
-  const liveImages = room.images.filter(img => !img.deleted);
-  const total = liveMats.length, done = liveMats.filter(m => m.done).length;
-  const pct = total ? Math.round(done / total * 100) : 0;
-  const estTotal = liveMats.reduce((s, m) => s + (parseFloat(m.priceEst) || 0), 0);
-  const finalTotal = liveMats.reduce((s, m) => s + (parseFloat(m.priceFinal) || 0), 0);
-
-  const imgGrid = liveImages.map(img => {
-    const src = escHtml(img.url || img.data || '');
+  const imgGrid = imgs.map(img => {
+    const src = escHtml(img.url || '');
     const cap = img.description ? escHtml(img.description) : '';
     return `<div class="img-thumb" onclick="openImage('${src}','${room.id}','${img.id}')">
       <div class="img-thumb-photo"><img src="${src}" alt="wizualizacja"></div>
@@ -326,16 +237,18 @@ function renderContent() {
     </div>`;
   }).join('');
 
-  const matRows = liveMats.map(m => `
+  const matRows = mats.map(m => `
     <div class="mat-row ${m.done ? 'done-row' : ''}" data-id="${m.id}">
       <div class="drag-handle">⋮⋮</div>
       <input type="checkbox" class="mat-check" ${m.done ? 'checked' : ''} onchange="toggleMat('${room.id}','${m.id}')">
       <div class="mat-name-cell">
-        <div class="mat-name" contenteditable="true" onfocus="setEditing(true)" onblur="setEditing(false);editMat('${room.id}','${m.id}','name',this.innerText)">${escHtml(m.name)}</div>
+        <div class="mat-name" contenteditable="true"
+          onfocus="setEditing(true)"
+          onblur="setEditing(false);editMat('${room.id}','${m.id}','name',this.innerText)">${escHtml(m.name)}</div>
         <textarea class="mat-notes" placeholder="Notatki..."
           onfocus="setEditing(true);autoResize(this)"
           oninput="autoResize(this)"
-          onblur="setEditing(false);updateMatField('${room.id}','${m.id}','notes',this.value);save(true)">${escHtml(m.notes || '')}</textarea>
+          onblur="setEditing(false);editMat('${room.id}','${m.id}','notes',this.value)">${escHtml(m.notes || '')}</textarea>
       </div>
       <div class="mat-qty">
         <input type="number" value="${m.qty}" min="0" step="0.1"
@@ -366,18 +279,19 @@ function renderContent() {
       <div class="mat-del"><button onclick="delMat('${room.id}','${m.id}')" title="Usuń">×</button></div>
     </div>`).join('');
 
-  const deletedMatCount = room.materials.filter(m => m.deleted).length;
-  const deletedImgCount = room.images.filter(img => img.deleted).length;
-  const trashCount = deletedMatCount + deletedImgCount;
+  const trashCount = allMats(room.id).filter(m => m.deleted).length +
+                     allPhotos(room.id).filter(p => p.deleted).length;
 
   el.innerHTML = `
     <div class="room-header">
       <div class="room-title-row">
-        <div class="room-title" contenteditable="true" onfocus="setEditing(true)" onblur="setEditing(false);renameRoom('${room.id}',this.innerText)">${escHtml(room.name)}</div>
+        <div class="room-title" contenteditable="true"
+          onfocus="setEditing(true)"
+          onblur="setEditing(false);renameRoom('${room.id}',this.innerText)">${escHtml(room.name)}</div>
         ${total ? `<span class="progress-badge">${done}/${total} kupione</span>` : ''}
       </div>
       <div class="room-actions">
-${trashCount ? `<button class="btn" style="color:#aaa;font-size:13px" onclick="openTrash('${room.id}')">🗑 Kosz (${trashCount})</button>` : ''}
+        ${trashCount ? `<button class="btn" style="color:#aaa;font-size:13px" onclick="openTrash('${room.id}')">🗑 Kosz (${trashCount})</button>` : ''}
         <button class="btn danger" onclick="deleteRoom('${room.id}')">Usuń pomieszczenie</button>
       </div>
     </div>
@@ -385,18 +299,18 @@ ${trashCount ? `<button class="btn" style="color:#aaa;font-size:13px" onclick="o
       <textarea class="room-notes" placeholder="Notatki do pomieszczenia..."
         onfocus="setEditing(true);autoResize(this)"
         oninput="autoResize(this)"
-        onblur="setEditing(false);updateRoomNotes('${room.id}',this.value);save(true)">${escHtml(room.notes || '')}</textarea>
+        onblur="setEditing(false);updateRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
     </div>
     <div class="summary-bar">
       <div class="sum-card"><div class="sum-label">Wszystkich pozycji</div><div class="sum-val">${total}</div></div>
       <div class="sum-card"><div class="sum-label">Kupione</div><div class="sum-val" style="color:#3B6D11">${done}</div></div>
       <div class="sum-card"><div class="sum-label">Do kupienia</div><div class="sum-val" style="color:#BA7517">${total - done}</div></div>
       <div class="sum-card"><div class="sum-label">Postęp</div><div class="sum-val">${pct}%</div></div>
-      ${estTotal > 0 ? `<div class="sum-card"><div class="sum-label">Szacunkowy koszt</div><div class="sum-val" style="font-size:1rem">${formatPrice(estTotal)}</div></div>` : ''}
+      ${estTotal   > 0 ? `<div class="sum-card"><div class="sum-label">Szacunkowy koszt</div><div class="sum-val" style="font-size:1rem">${formatPrice(estTotal)}</div></div>` : ''}
       ${finalTotal > 0 ? `<div class="sum-card"><div class="sum-label">Koszt końcowy</div><div class="sum-val" style="font-size:1rem;color:#3B6D11">${formatPrice(finalTotal)}</div></div>` : ''}
     </div>
     <div class="img-section">
-      ${liveImages.length ? `<div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div>` : ''}
+      ${imgs.length ? `<div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div>` : ''}
       <div class="img-drop-zone" id="img-drop-zone-${room.id}"
         ondragover="event.preventDefault();this.classList.add('drag-over')"
         ondragleave="this.classList.remove('drag-over')"
@@ -436,31 +350,47 @@ ${trashCount ? `<button class="btn" style="color:#aaa;font-size:13px" onclick="o
         <button class="btn primary" onclick="addMat('${room.id}')">Dodaj</button>
       </div>
     </div>`;
+
   initMatSortable(room.id);
-  el.querySelectorAll('textarea').forEach(autoResize);
+  el.querySelectorAll('textarea').forEach(t => window.autoResize(t));
+}
+
+// ---------------------------------------------------------------------------
+// Sortable
+// ---------------------------------------------------------------------------
+
+function initRoomSortable() {
+  const el = document.getElementById('room-list');
+  if (!el) return;
+  if (roomSortable) { try { roomSortable.destroy(); } catch (e) {} roomSortable = null; }
+  roomSortable = Sortable.create(el, {
+    animation: 150, handle: '.drag-handle', ghostClass: 'sortable-ghost', filter: '.trash-item',
+    onEnd: async evt => {
+      if (!db) return;
+      const live = liveRooms();
+      const [moved] = live.splice(evt.oldIndex, 1);
+      live.splice(evt.newIndex, 0, moved);
+      const batch = writeBatch(db);
+      live.forEach((r, i) => batch.update(roomDoc(r.id), { order: i * 1000 }));
+      await batch.commit();
+    }
+  });
 }
 
 function initMatSortable(roomId) {
   const el = document.getElementById('mat-list');
-  if (matSortable) {
-    try { matSortable.destroy(); } catch (e) {}
-    matSortable = null;
-  }
+  if (matSortable) { try { matSortable.destroy(); } catch (e) {} matSortable = null; }
   if (!el || (el.children.length <= 1 && el.innerText.includes('Brak'))) return;
   matSortable = Sortable.create(el, {
-    animation: 150,
-    handle: '.drag-handle',
-    ghostClass: 'sortable-ghost',
-    onEnd: (evt) => {
-      const room = getRoom(roomId);
-      if (!room) return;
-      const liveMats = room.materials.filter(m => !m.deleted);
-      const [moved] = liveMats.splice(evt.oldIndex, 1);
-      liveMats.splice(evt.newIndex, 0, moved);
-      let liveIdx = 0;
-      room.materials = room.materials.map(m => m.deleted ? m : liveMats[liveIdx++]);
-      save(true);
-      render(false);
+    animation: 150, handle: '.drag-handle', ghostClass: 'sortable-ghost',
+    onEnd: async evt => {
+      if (!db) return;
+      const mats = liveMats(roomId);
+      const [moved] = mats.splice(evt.oldIndex, 1);
+      mats.splice(evt.newIndex, 0, moved);
+      const batch = writeBatch(db);
+      mats.forEach((m, i) => batch.update(matDoc(roomId, m.id), { order: i * 1000 }));
+      await batch.commit();
     }
   });
 }
@@ -470,127 +400,94 @@ function initMatSortable(roomId) {
 // ---------------------------------------------------------------------------
 
 window.openTrash = function(roomId) {
-  // If roomId given: show deleted materials + images for that room.
-  // If no roomId: show all deleted rooms.
   const buildBody = () => {
     let html = '';
-
     if (roomId) {
-      const room = getRoom(roomId);
-      if (!room) return '<p style="color:#aaa">Brak usuniętych elementów.</p>';
-
-      const deletedMats = room.materials.filter(m => m.deleted);
-      const deletedImgs = room.images.filter(img => img.deleted);
-
+      const deletedMats  = allMats(roomId).filter(m => m.deleted);
+      const deletedImgs  = allPhotos(roomId).filter(p => p.deleted);
       if (deletedMats.length) {
         html += `<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Materiały</div>`;
-        html += deletedMats.map(m => `
-          <div class="trash-row">
-            <span style="flex:1;font-size:13px">${escHtml(m.name)}</span>
-            <button class="btn" style="font-size:12px;padding:4px 10px" onclick="restoreMat('${roomId}','${m.id}')">Przywróć</button>
-          </div>`).join('');
+        html += deletedMats.map(m => `<div class="trash-row">
+          <span style="flex:1;font-size:13px">${escHtml(m.name)}</span>
+          <button class="btn" style="font-size:12px;padding:4px 10px" onclick="restoreMat('${roomId}','${m.id}')">Przywróć</button>
+        </div>`).join('');
       }
-
       if (deletedImgs.length) {
         html += `<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin:12px 0 8px">Zdjęcia</div>`;
         html += `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px">`;
-        html += deletedImgs.map(img => {
-          const src = escHtml(img.url || img.data || '');
-          return `<div style="position:relative;width:80px;height:60px;border-radius:6px;overflow:hidden;border:0.5px solid #ddd">
-            <img src="${src}" style="width:100%;height:100%;object-fit:cover;opacity:0.5">
-            <button class="btn" style="position:absolute;bottom:2px;right:2px;font-size:10px;padding:2px 6px" onclick="restoreImg('${roomId}','${img.id}')">↩</button>
-          </div>`;
-        }).join('');
+        html += deletedImgs.map(img => `
+          <div style="position:relative;width:80px;height:60px;border-radius:6px;overflow:hidden;border:0.5px solid #ddd">
+            <img src="${escHtml(img.url)}" style="width:100%;height:100%;object-fit:cover;opacity:0.5">
+            <button class="btn" style="position:absolute;bottom:2px;right:2px;font-size:10px;padding:2px 6px" onclick="restorePhoto('${roomId}','${img.id}')">↩</button>
+          </div>`).join('');
         html += '</div>';
       }
-
-      if (!deletedMats.length && !deletedImgs.length) {
-        html = '<p style="color:#aaa;font-size:13px">Kosz jest pusty.</p>';
-      }
+      if (!deletedMats.length && !deletedImgs.length) html = '<p style="color:#aaa;font-size:13px">Kosz jest pusty.</p>';
     } else {
-      // Global trash — deleted rooms
-      const deletedRooms = state.rooms.filter(r => r.deleted);
+      const deletedRooms = allRooms().filter(r => r.deleted);
       if (deletedRooms.length) {
         html += `<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Pomieszczenia</div>`;
-        html += deletedRooms.map(r => `
-          <div class="trash-row">
-            <span style="flex:1;font-size:13px">${escHtml(r.name)}</span>
-            <button class="btn" style="font-size:12px;padding:4px 10px" onclick="restoreRoom('${r.id}')">Przywróć</button>
-          </div>`).join('');
+        html += deletedRooms.map(r => `<div class="trash-row">
+          <span style="flex:1;font-size:13px">${escHtml(r.name)}</span>
+          <button class="btn" style="font-size:12px;padding:4px 10px" onclick="restoreRoom('${r.id}')">Przywróć</button>
+        </div>`).join('');
       }
-
-      // Also show rooms that have deleted content
-      const roomsWithDeletedContent = state.rooms.filter(r =>
-        !r.deleted && (r.materials.some(m => m.deleted) || r.images.some(img => img.deleted))
-      );
-      if (roomsWithDeletedContent.length) {
+      const withDeleted = [...roomsMap.keys()].filter(rId => {
+        const r = getRoom(rId);
+        return r && !r.deleted && (allMats(rId).some(m => m.deleted) || allPhotos(rId).some(p => p.deleted));
+      });
+      if (withDeleted.length) {
         html += `<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin:12px 0 8px">Usunięte elementy w pomieszczeniach</div>`;
-        html += roomsWithDeletedContent.map(r => {
-          const dc = r.materials.filter(m => m.deleted).length + r.images.filter(img => img.deleted).length;
+        html += withDeleted.map(rId => {
+          const r = getRoom(rId);
+          const dc = allMats(rId).filter(m => m.deleted).length + allPhotos(rId).filter(p => p.deleted).length;
           return `<div class="trash-row">
             <span style="flex:1;font-size:13px">${escHtml(r.name)} <span style="color:#aaa">(${dc})</span></span>
-            <button class="btn" style="font-size:12px;padding:4px 10px" onclick="closeModal();openTrash('${r.id}')">Pokaż</button>
+            <button class="btn" style="font-size:12px;padding:4px 10px" onclick="closeModal();openTrash('${rId}')">Pokaż</button>
           </div>`;
         }).join('');
       }
-
-      if (!deletedRooms.length && !roomsWithDeletedContent.length) {
-        html = '<p style="color:#aaa;font-size:13px">Kosz jest pusty.</p>';
-      }
+      if (!deletedRooms.length && !withDeleted.length) html = '<p style="color:#aaa;font-size:13px">Kosz jest pusty.</p>';
     }
     return html;
   };
-
   showModal('Kosz', buildBody, null, false);
 };
 
 window.restoreRoom = function(id) {
-  const r = getRoom(id);
-  if (!r) return;
-  r.deleted = false;
-  if (!state.activeRoom) state.activeRoom = id;
+  if (!db) return;
+  updateDoc(roomDoc(id), { deleted: false });
+  if (!activeRoomId) { activeRoomId = id; localStorage.setItem('activeRoom', id); }
   closeModal();
-  render();
 };
 
 window.restoreMat = function(roomId, matId) {
-  const m = findMat(roomId, matId);
-  if (!m) return;
-  m.deleted = false;
+  if (!db) return;
+  updateDoc(matDoc(roomId, matId), { deleted: false });
   closeModal();
-  render();
 };
 
-window.restoreImg = function(roomId, imgId) {
-  const r = getRoom(roomId);
-  if (!r) return;
-  const img = r.images.find(i => i.id === imgId);
-  if (!img) return;
-  img.deleted = false;
+window.restorePhoto = function(roomId, photoId) {
+  if (!db) return;
+  updateDoc(photoDoc(roomId, photoId), { deleted: false });
   closeModal();
-  render();
 };
 
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
 
-function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
-
-function formatPrice(val) {
-  if (val == null || val === '') return '—';
-  return Number(val).toLocaleString('pl-PL', { minimumFractionDigits: 0, maximumFractionDigits: 2 }) + ' zł';
-}
-
 window.selectRoom = function(id) {
-  if (state.activeRoom === id) return;
-  state.activeRoom = id;
-  render(false);
+  if (activeRoomId === id) return;
+  activeRoomId = id;
+  localStorage.setItem('activeRoom', id);
+  subscribeToRoom(id);
+  renderSidebar();
   window.toggleSidebar(false);
 };
 
 window.toggleSidebar = function(force) {
-  const sb = document.querySelector('.sidebar');
+  const sb      = document.querySelector('.sidebar');
   const overlay = document.querySelector('.sidebar-overlay');
   if (sb) {
     const isOpen = force !== undefined ? force : !sb.classList.contains('open');
@@ -599,167 +496,123 @@ window.toggleSidebar = function(force) {
   }
 };
 
-window.renameRoom = function(id, name) {
-  const r = getRoom(id); if (r && name.trim()) { r.name = name.trim(); render(true); }
-};
-
-window.renameRoomNotes = function(id, notes) {
-  const r = getRoom(id); if (r) { r.notes = notes; save(true); }
-};
-
-window.updateRoomNotes = function(id, notes) {
-  const r = getRoom(id); if (!r) return;
-  r.notes = notes;
-};
-
-window.updateMatField = function(roomId, matId, field, val) {
-  const m = findMat(roomId, matId); if (!m) return;
-  m[field] = val;
-};
-
 window.addRoom = function() {
-  showModal('Nowe pomieszczenie', () => `<input id="modal-input" placeholder="Nazwa pomieszczenia..." onkeydown="if(event.key==='Enter')modalConfirm()">`,
-    val => {
-      if (!val || !val.trim()) return;
-      const r = { id: uid(), name: val.trim(), images: [], materials: [], notes: '', deleted: false };
-      state.rooms.push(r);
-      state.activeRoom = r.id;
-      render();
+  showModal('Nowe pomieszczenie',
+    () => `<input id="modal-input" placeholder="Nazwa pomieszczenia..." onkeydown="if(event.key==='Enter')modalConfirm()">`,
+    async val => {
+      if (!val?.trim() || !db) return;
+      const order = nextOrder(liveRooms());
+      const ref = doc(roomsCol());
+      await setDoc(ref, { name: val.trim(), notes: '', order, deleted: false });
+      activeRoomId = ref.id;
+      localStorage.setItem('activeRoom', ref.id);
+      subscribeToRoom(ref.id);
     });
 };
 
+window.renameRoom = function(id, name) {
+  if (!name.trim() || !db) return;
+  updateDoc(roomDoc(id), { name: name.trim() });
+};
+
+window.updateRoomNotes = function(id, notes) {
+  if (!db) return;
+  updateDoc(roomDoc(id), { notes });
+};
+
 window.deleteRoom = function(id) {
-  if (!confirm('Przenieść to pomieszczenie do kosza?')) return;
-  const r = getRoom(id);
-  if (!r) return;
-  r.deleted = true;
-  const liveRooms = state.rooms.filter(r => !r.deleted);
-  state.activeRoom = liveRooms.length ? liveRooms[0].id : null;
-  render();
+  if (!confirm('Przenieść to pomieszczenie do kosza?') || !db) return;
+  updateDoc(roomDoc(id), { deleted: true });
+  const next = liveRooms().find(r => r.id !== id);
+  activeRoomId = next?.id || null;
+  activeRoomId ? localStorage.setItem('activeRoom', activeRoomId)
+               : localStorage.removeItem('activeRoom');
+  subscribeToRoom(activeRoomId);
 };
 
 window.addMat = function(roomId) {
-  const nameInp = document.getElementById('in-name');
-  const name = nameInp.value.trim();
+  if (!db) return;
+  const name = document.getElementById('in-name').value.trim();
   if (!name) return;
-  const qty = parseFloat(document.getElementById('in-qty').value) || 1;
-  const unit = document.getElementById('in-unit').value.trim() || 'szt.';
-  const link = document.getElementById('in-link').value.trim();
-  const priceEstRaw = document.getElementById('in-price-est').value;
-  const priceFinalRaw = document.getElementById('in-price-final').value;
-  const priceEst = priceEstRaw !== '' ? parseFloat(priceEstRaw) : null;
-  const priceFinal = priceFinalRaw !== '' ? parseFloat(priceFinalRaw) : null;
-  getRoom(roomId).materials.push({ id: uid(), name, qty, unit, link, done: false, notes: '', priceEst, priceFinal, deleted: false });
-  render(true);
+  const qty          = parseFloat(document.getElementById('in-qty').value) || 1;
+  const unit         = document.getElementById('in-unit').value.trim() || 'szt.';
+  const link         = document.getElementById('in-link').value.trim();
+  const priceEstRaw  = document.getElementById('in-price-est').value;
+  const priceFinalRaw= document.getElementById('in-price-final').value;
+  const priceEst     = priceEstRaw   !== '' ? parseFloat(priceEstRaw)   : null;
+  const priceFinal   = priceFinalRaw !== '' ? parseFloat(priceFinalRaw) : null;
+  const order        = nextOrder(liveMats(roomId));
+  addDoc(matsCol(roomId), { name, qty, unit, link, done: false, notes: '', priceEst, priceFinal, order, deleted: false });
+  ['in-name','in-qty','in-unit','in-link','in-price-est','in-price-final'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
   document.getElementById('in-name')?.focus();
 };
 
 window.toggleMat = function(roomId, matId) {
-  const m = findMat(roomId, matId);
+  if (!db) return;
+  const m = getMat(roomId, matId);
   if (!m) return;
-  m.done = !m.done;
-  render();
+  updateDoc(matDoc(roomId, matId), { done: !m.done });
 };
 
 window.editMat = function(roomId, matId, field, val) {
-  const m = findMat(roomId, matId);
-  if (!m) return;
-  if (field === 'qty') {
-    m[field] = parseFloat(val) || 0;
-  } else if (field === 'priceEst' || field === 'priceFinal') {
-    m[field] = val !== '' ? parseFloat(val) : null;
-  } else {
-    m[field] = val.trim();
-  }
-  save(true);
+  if (!db) return;
+  let parsed = val;
+  if      (field === 'qty')                            parsed = parseFloat(val) || 0;
+  else if (field === 'priceEst' || field === 'priceFinal') parsed = val !== '' ? parseFloat(val) : null;
+  else if (field === 'name')                           { parsed = val.trim(); if (!parsed) return; }
+  else if (field === 'unit' || field === 'link')       parsed = val.trim();
+  updateDoc(matDoc(roomId, matId), { [field]: parsed });
 };
 
 window.delMat = function(roomId, matId) {
-  const m = findMat(roomId, matId);
-  if (!m) return;
-  m.deleted = true;
-  render();
+  if (!db) return;
+  updateDoc(matDoc(roomId, matId), { deleted: true });
 };
 
 window.addImages = function(roomId, evt) {
-  if (!storage) {
-    alert("Cloud Storage nie jest skonfigurowany. Zdjęcia pozostaną tylko lokalnie.");
-    const r = getRoom(roomId);
-    if (!r) return;
-    [...evt.target.files].forEach(f => {
-      const fr = new FileReader();
-      fr.onload = e => {
-        r.images.push({ id: uid(), data: e.target.result, name: f.name, deleted: false });
-        render();
-      };
-      fr.readAsDataURL(f);
-    });
-    return;
-  }
-
+  if (!storage) { alert("Cloud Storage nie jest skonfigurowany."); return; }
   const files = [...evt.target.files];
   if (!files.length) return;
-
   setBanner("sync", `Przesyłanie ${files.length} zdjęć…`);
-  const newImages = [];
   let failCount = 0;
-
-  const uploads = files.map(async f => {
-    const fileId = uid();
+  const baseOrder = nextOrder(livePhotos(roomId));
+  Promise.all(files.map(async (f, i) => {
+    const fileId = Math.random().toString(36).slice(2, 10);
     const path = `rooms/${roomId}/${fileId}_${f.name}`;
-    const storageRef = ref(storage, path);
     try {
-      const snap = await uploadBytes(storageRef, f);
-      const url = await getDownloadURL(snap.ref);
-      newImages.push({ id: uid(), url, path, name: f.name, deleted: false });
+      const snap = await uploadBytes(ref(storage, path), f);
+      const url  = await getDownloadURL(snap.ref);
+      await addDoc(photosCol(roomId), { url, path, name: f.name, description: '', order: baseOrder + i * 100, deleted: false });
     } catch (err) {
-      console.error(`[Storage] Error during upload of ${f.name}:`, err.code, err.message);
+      console.error('[Storage] upload error:', err.code, err.message);
       failCount++;
-      setBanner("error", "Błąd: " + (err.code || err.message));
     }
-  });
-
-  Promise.all(uploads).then(() => {
-    if (newImages.length > 0) {
-      const r = getRoom(roomId);
-      if (r) {
-        r.images.push(...newImages);
-        setBanner("sync", failCount > 0 ? `Przesłano ${newImages.length}, błąd ${failCount}` : "Zdjęcia przesłane", 3000);
-        render(true);
-      } else {
-        setBanner("error", "Pokój nie istnieje — zdjęcia przesłane do Storage, ale nie zapisane");
-      }
-    } else if (failCount > 0) {
-      setBanner("error", "Nie udało się przesłać zdjęć");
-    }
+  })).then(() => {
+    setBanner("sync", failCount > 0 ? `Przesłano ${files.length - failCount}, błąd ${failCount}` : "Zdjęcia przesłane", 3000);
   });
 };
 
-window.delImg = function(roomId, imgId) {
-  const r = getRoom(roomId);
-  if (!r) return;
-  const img = r.images.find(i => i.id === imgId);
-  if (!img) return;
-  img.deleted = true;
-  render(true);
+window.delImg = function(roomId, photoId) {
+  if (!db) return;
+  updateDoc(photoDoc(roomId, photoId), { deleted: true });
 };
 
-window.openImage = function(url, roomId, imgId) {
-  const img = findImgObj(roomId, imgId);
+window.openImage = function(url, roomId, photoId) {
+  const photo = getPhoto(roomId, photoId);
   const overlay = document.createElement('div');
   overlay.className = 'img-overlay';
   overlay.innerHTML = `
     <img src="${url}" alt="enlarged">
     <div class="img-overlay-footer">
-      <textarea class="img-overlay-desc" placeholder="Opis zdjęcia (opcjonalnie)...">${img ? escHtml(img.description || '') : ''}</textarea>
+      <textarea class="img-overlay-desc" placeholder="Opis zdjęcia (opcjonalnie)...">${photo ? escHtml(photo.description || '') : ''}</textarea>
       <span class="img-overlay-hint">Kliknij zdjęcie lub naciśnij Esc, żeby zamknąć</span>
     </div>`;
   const close = () => {
     const desc = overlay.querySelector('.img-overlay-desc').value;
-    if (img && desc !== (img.description || '')) {
-      img.description = desc;
-      save(true);
-      render(false);
+    if (photo && db && desc !== (photo.description || '')) {
+      updateDoc(photoDoc(roomId, photoId), { description: desc });
     }
     document.body.removeChild(overlay);
   };
@@ -770,40 +623,59 @@ window.openImage = function(url, roomId, imgId) {
   overlay.querySelector('.img-overlay-desc').focus();
 };
 
-function findImgObj(roomId, imgId) {
-  return getRoom(roomId)?.images.find(i => i.id === imgId);
-}
-
 window.handleImgDrop = function(roomId, evt) {
   evt.preventDefault();
-  const zone = document.getElementById(`img-drop-zone-${roomId}`);
-  if (zone) zone.classList.remove('drag-over');
+  document.getElementById(`img-drop-zone-${roomId}`)?.classList.remove('drag-over');
   const files = [...(evt.dataTransfer.files || [])].filter(f => f.type.startsWith('image/'));
-  if (!files.length) return;
-  const fakeEvt = { target: { files } };
-  window.addImages(roomId, fakeEvt);
+  if (files.length) window.addImages(roomId, { target: { files } });
 };
 
+// ---------------------------------------------------------------------------
+// Export / Import
+// ---------------------------------------------------------------------------
+
 window.exportJSON = function() {
-  const json = JSON.stringify(state, null, 2);
-  const blob = new Blob([json], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
+  const data = {
+    rooms: allRooms().map(r => ({
+      ...r,
+      materials: allMats(r.id),
+      photos:    allPhotos(r.id)
+    }))
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
   a.href = url; a.download = 'remont_materialy.json';
   document.body.appendChild(a); a.click();
   document.body.removeChild(a); URL.revokeObjectURL(url);
 };
 
 window.importJSON = function(evt) {
-  const f = evt.target.files[0]; if (!f) return;
+  const f = evt.target.files[0]; if (!f || !db) return;
   const fr = new FileReader();
-  fr.onload = e => {
+  fr.onload = async e => {
     try {
-      state = JSON.parse(e.target.result);
-      if (!state.activeRoom && state.rooms.length) state.activeRoom = state.rooms[0].id;
-      ensureIds();
-      render();
-    } catch (err) { alert('Błąd pliku — upewnij się, że to prawidłowy plik JSON z tej aplikacji.'); }
+      const data = JSON.parse(e.target.result);
+      const rooms = data.rooms || [];
+      if (!confirm(`Importować ${rooms.length} pomieszczeń? Dane zostaną dodane obok istniejących.`)) return;
+      setBanner("sync", "Importowanie…");
+      for (let i = 0; i < rooms.length; i++) {
+        const r    = rooms[i];
+        const rRef = doc(roomsCol());
+        await setDoc(rRef, { name: r.name || 'Pomieszczenie', notes: r.notes || '', order: nextOrder(liveRooms()) + i * 1000, deleted: false });
+        const mats = r.materials || [];
+        for (let j = 0; j < mats.length; j++) {
+          const m = mats[j];
+          await addDoc(matsCol(rRef.id), {
+            name: m.name || '', qty: m.qty || 1, unit: m.unit || 'szt.',
+            link: m.link || '', done: m.done || false, notes: m.notes || '',
+            priceEst: m.priceEst ?? null, priceFinal: m.priceFinal ?? null,
+            order: j * 1000, deleted: false
+          });
+        }
+      }
+      setBanner("sync", "Zaimportowano", 3000);
+    } catch { alert('Błąd pliku JSON.'); }
   };
   fr.readAsText(f);
 };
@@ -813,12 +685,8 @@ window.openShareModal = function() {
     <p style="font-size:13px;color:#555;margin-bottom:12px">
       ${db
         ? 'Synchronizacja przez Firestore jest aktywna — wszystkie osoby z dostępem do strony widzą te same dane i zdjęcia w czasie rzeczywistym.'
-        : 'Firestore nie jest skonfigurowany — dane są przechowywane lokalnie w przeglądarce.'}
-    </p>
-    <p style="font-size:13px;color:#555;margin-bottom:12px">
-      Zdjęcia są przechowywane w Firebase Cloud Storage i dostępne dla każdego współdzielącego listę.
-    </p>
-  `, null, false);
+        : 'Firestore nie jest skonfigurowany — skonfiguruj firebase-config.js.'}
+    </p>`, null, false);
 };
 
 // ---------------------------------------------------------------------------
@@ -828,8 +696,7 @@ window.openShareModal = function() {
 function showModal(title, bodyFn, cb, hasInput = true) {
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-body').innerHTML = typeof bodyFn === 'function' ? bodyFn() : '';
-  const btns = document.getElementById('modal-btns');
-  btns.innerHTML = cb
+  document.getElementById('modal-btns').innerHTML = cb
     ? `<button class="btn" onclick="closeModal()">Anuluj</button><button class="btn primary" onclick="modalConfirm()">OK</button>`
     : `<button class="btn primary" onclick="closeModal()">Zamknij</button>`;
   document.getElementById('modal').style.display = 'flex';
@@ -852,5 +719,23 @@ window.closeModal = function() {
 document.getElementById('modal').addEventListener('click', e => { if (e.target.id === 'modal') window.closeModal(); });
 
 // ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+function init() {
+  if (db) {
+    setBanner("sync", "Łączenie…");
+    subscribeToRooms();
+  } else {
+    setBanner("local", "Tryb lokalny — skonfiguruj firebase-config.js");
+    document.getElementById('content').innerHTML = '<div class="empty-state">Brak połączenia z Firebase</div>';
+  }
+}
+
+window.addEventListener('beforeunload', () => {
+  if (unsubRooms)     unsubRooms();
+  if (unsubMaterials) unsubMaterials();
+  if (unsubPhotos)    unsubPhotos();
+});
 
 init();
