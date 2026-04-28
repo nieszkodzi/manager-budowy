@@ -3,7 +3,7 @@ import { getFirestore, doc, onSnapshot, setDoc } from "https://www.gstatic.com/f
 import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-storage.js";
 
 // ---------------------------------------------------------------------------
-// Firebase setup — skipped gracefully if config is missing or incomplete
+// Firebase setup
 // ---------------------------------------------------------------------------
 
 const cfg = window.FIREBASE_CONFIG || {};
@@ -19,7 +19,7 @@ if (window.FIREBASE_CONFIG) {
 let db = null;
 let storage = null;
 let unsubscribe = null;
-let pendingSaveCount = 0; // number of setDoc calls not yet acknowledged by Firestore
+let pendingSaveCount = 0;
 let saveDebounceTimer = null;
 
 function debouncedSave() {
@@ -60,16 +60,24 @@ function uid() { return Math.random().toString(36).slice(2, 10); }
 function getRoom(id) { return state.rooms.find(r => r.id === id); }
 function findMat(roomId, matId) { return getRoom(roomId)?.materials.find(m => m.id === matId); }
 
-// Ensure every material and image has a stable id — called after loading from any source.
+// Back-fill stable ids and deleted:false on items that predate this feature.
 function ensureIds() {
   state.rooms.forEach(r => {
-    r.materials.forEach(m => { if (!m.id) m.id = uid(); });
-    r.images.forEach(img => { if (!img.id) img.id = uid(); });
+    if (!r.id) r.id = uid();
+    if (r.deleted === undefined) r.deleted = false;
+    r.materials.forEach(m => {
+      if (!m.id) m.id = uid();
+      if (m.deleted === undefined) m.deleted = false;
+    });
+    r.images.forEach(img => {
+      if (!img.id) img.id = uid();
+      if (img.deleted === undefined) img.deleted = false;
+    });
   });
 }
 
 // ---------------------------------------------------------------------------
-// Persistence — Firestore when available, localStorage as fallback
+// Persistence
 // ---------------------------------------------------------------------------
 
 const LOCAL_KEY = 'remont_v2';
@@ -83,7 +91,8 @@ function stateForStorage() {
         id: img.id,
         name: img.name,
         url: img.url,
-        path: img.path
+        path: img.path,
+        deleted: img.deleted
         // data (local data URLs) intentionally not persisted to Firestore
       }))
     }))
@@ -109,7 +118,7 @@ function init() {
   if (saved) {
     try { state = JSON.parse(saved); } catch (e) {}
   } else {
-    state.rooms = ROOMS_DEFAULT.map(n => ({ id: uid(), name: n, images: [], materials: [] }));
+    state.rooms = ROOMS_DEFAULT.map(n => ({ id: uid(), name: n, images: [], materials: [], deleted: false }));
     state.activeRoom = state.rooms[0].id;
   }
   if (!state.activeRoom && state.rooms.length) state.activeRoom = state.rooms[0].id;
@@ -121,16 +130,10 @@ function init() {
     unsubscribe = onSnapshot(doc(db, FIRESTORE_DOC), snapshot => {
       console.log("[Firestore] snapshot received, exists:", snapshot.exists(), "fromCache:", snapshot.metadata.fromCache);
 
-      // Skip snapshots that include our own pending writes — they will be
-      // followed by a confirmed snapshot once the write is acknowledged.
       if (snapshot.metadata.hasPendingWrites) {
         console.log("[Firestore] pending writes, skipping update");
         return;
       }
-
-      // Block incoming remote state while we have saves in-flight or the user
-      // is actively typing. The confirmed snapshot from our own write will
-      // arrive once Firestore acknowledges it, carrying our latest data.
       if (pendingSaveCount > 0) {
         console.log("[Firestore] save in flight, skipping remote update");
         return;
@@ -143,22 +146,11 @@ function init() {
       if (snapshot.exists()) {
         const remote = snapshot.data();
         console.log("[Firestore] applying remote state");
-
-        // Firestore is the single source of truth. We do NOT re-add locally
-        // cached images: doing so would resurrect images deleted on other tabs.
         state.rooms = remote.rooms || [];
-        ensureIds(); // assign ids to any items created before this fix
-        // Do not update state.activeRoom from remote to allow independent navigation
+        ensureIds();
         localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
         setBanner("sync", "Zsynchronizowano", 2000);
       } else {
-        // Document does not exist in Firestore. This can happen on a genuine
-        // first run, but also transiently when the SDK reconnects from
-        // offline/background before the server confirms the cached document.
-        // We NEVER push local state here — doing so would overwrite real data
-        // with a stale local copy (e.g. a phone waking up from sleep).
-        // On a true first run the document will be created the first time the
-        // user makes a change (addMat, addRoom, etc.) which calls save(true).
         console.log("[Firestore] document does not exist — waiting for first user action to create it");
         setBanner("sync", "Gotowy", 2000);
       }
@@ -216,8 +208,10 @@ function render(pushToFirestore = true) {
 
 function renderSidebar() {
   const el = document.getElementById('room-list');
-  el.innerHTML = state.rooms.map(r => {
-    const total = r.materials.length, done = r.materials.filter(m => m.done).length;
+  const liveRooms = state.rooms.filter(r => !r.deleted);
+  el.innerHTML = liveRooms.map(r => {
+    const liveMats = r.materials.filter(m => !m.deleted);
+    const total = liveMats.length, done = liveMats.filter(m => m.done).length;
     const cls = total === 0 ? 'empty' : done === total ? 'done' : 'partial';
     const active = r.id === state.activeRoom ? 'active' : '';
     return `<div class="room-item ${active}" data-id="${r.id}">
@@ -227,6 +221,21 @@ function renderSidebar() {
       </div>
     </div>`;
   }).join('');
+
+  // Trash entry at the bottom — only if there's anything deleted
+  const hasDeletedRooms = state.rooms.some(r => r.deleted);
+  const hasDeletedContent = state.rooms.some(r =>
+    r.materials.some(m => m.deleted) || r.images.some(img => img.deleted)
+  );
+  if (hasDeletedRooms || hasDeletedContent) {
+    el.innerHTML += `<div class="room-item trash-item" onclick="openTrash()">
+      <div style="width:24px"></div>
+      <div class="room-click-area" style="color:#aaa;font-size:12px">
+        <span>🗑 Kosz</span>
+      </div>
+    </div>`;
+  }
+
   initRoomSortable();
 }
 
@@ -241,9 +250,20 @@ function initRoomSortable() {
     animation: 150,
     handle: '.drag-handle',
     ghostClass: 'sortable-ghost',
+    filter: '.trash-item',
     onEnd: (evt) => {
-      const moved = state.rooms.splice(evt.oldIndex, 1)[0];
-      state.rooms.splice(evt.newIndex, 0, moved);
+      // Sortable operates on the visible (live) room list only.
+      // Map DOM indices back to the full state.rooms array.
+      const liveRooms = state.rooms.filter(r => !r.deleted);
+      const movedRoom = liveRooms[evt.oldIndex];
+      if (!movedRoom) return;
+      // Re-order within the live subset, then rebuild state.rooms preserving deleted rooms at their positions.
+      const reordered = [...liveRooms];
+      const [moved] = reordered.splice(evt.oldIndex, 1);
+      reordered.splice(evt.newIndex, 0, moved);
+      // Reconstruct full array: replace live slots with reordered, keep deleted in place.
+      let liveIdx = 0;
+      state.rooms = state.rooms.map(r => r.deleted ? r : reordered[liveIdx++]);
       save(true);
     }
   });
@@ -261,21 +281,21 @@ function autoResize(el) {
 function renderContent() {
   const el = document.getElementById('content');
   const room = getRoom(state.activeRoom);
-  if (!room) { el.innerHTML = '<div class="empty-state">Wybierz pomieszczenie</div>'; return; }
+  if (!room || room.deleted) { el.innerHTML = '<div class="empty-state">Wybierz pomieszczenie</div>'; return; }
 
-  // If user is currently typing, don't re-render the content area to avoid losing focus/cursor position.
-  // We'll rely on the blur events to update the state and trigger a proper render if needed.
   if (isEditing && document.activeElement && el.contains(document.activeElement)) {
     console.log("[Render] skipping content render due to active editing");
     return;
   }
-  const total = room.materials.length, done = room.materials.filter(m => m.done).length;
-  const pct = total ? Math.round(done / total * 100) : 0;
-  const estTotal = room.materials.reduce((s, m) => s + (parseFloat(m.priceEst) || 0), 0);
-  const finalTotal = room.materials.reduce((s, m) => s + (parseFloat(m.priceFinal) || 0), 0);
 
-  // Use img.id for deletion — never array index, which can shift after remote sync.
-  const imgGrid = room.images.map(img => {
+  const liveMats = room.materials.filter(m => !m.deleted);
+  const liveImages = room.images.filter(img => !img.deleted);
+  const total = liveMats.length, done = liveMats.filter(m => m.done).length;
+  const pct = total ? Math.round(done / total * 100) : 0;
+  const estTotal = liveMats.reduce((s, m) => s + (parseFloat(m.priceEst) || 0), 0);
+  const finalTotal = liveMats.reduce((s, m) => s + (parseFloat(m.priceFinal) || 0), 0);
+
+  const imgGrid = liveImages.map(img => {
     const src = escHtml(img.url || img.data || '');
     return `<div class="img-thumb" onclick="openImage('${src}')">
       <img src="${src}" alt="wizualizacja">
@@ -283,8 +303,7 @@ function renderContent() {
     </div>`;
   }).join('');
 
-  // Use m.id for all operations — never array index, which can shift after remote sync.
-  const matRows = room.materials.map(m => `
+  const matRows = liveMats.map(m => `
     <div class="mat-row ${m.done ? 'done-row' : ''}" data-id="${m.id}">
       <div class="drag-handle">⋮⋮</div>
       <input type="checkbox" class="mat-check" ${m.done ? 'checked' : ''} onchange="toggleMat('${room.id}','${m.id}')">
@@ -322,6 +341,10 @@ function renderContent() {
       <div class="mat-del"><button onclick="delMat('${room.id}','${m.id}')" title="Usuń">×</button></div>
     </div>`).join('');
 
+  const deletedMatCount = room.materials.filter(m => m.deleted).length;
+  const deletedImgCount = room.images.filter(img => img.deleted).length;
+  const trashCount = deletedMatCount + deletedImgCount;
+
   el.innerHTML = `
     <div class="room-header">
       <div class="room-title-row">
@@ -332,6 +355,7 @@ function renderContent() {
         <label class="btn" style="cursor:pointer;font-size:13px">+ Dodaj zdjęcie
           <input type="file" accept="image/*" multiple onchange="addImages('${room.id}',event)">
         </label>
+        ${trashCount ? `<button class="btn" style="color:#aaa;font-size:13px" onclick="openTrash('${room.id}')">🗑 Kosz (${trashCount})</button>` : ''}
         <button class="btn danger" onclick="deleteRoom('${room.id}')">Usuń pomieszczenie</button>
       </div>
     </div>
@@ -347,7 +371,7 @@ function renderContent() {
       ${estTotal > 0 ? `<div class="sum-card"><div class="sum-label">Szacunkowy koszt</div><div class="sum-val" style="font-size:1rem">${formatPrice(estTotal)}</div></div>` : ''}
       ${finalTotal > 0 ? `<div class="sum-card"><div class="sum-label">Koszt końcowy</div><div class="sum-val" style="font-size:1rem;color:#3B6D11">${formatPrice(finalTotal)}</div></div>` : ''}
     </div>
-    ${room.images.length ? `<div class="img-section"><div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div></div>` : ''}
+    ${liveImages.length ? `<div class="img-section"><div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div></div>` : ''}
     <div class="materials-section">
       <div class="mat-header">
         <div style="width:24px"></div>
@@ -381,8 +405,6 @@ function renderContent() {
       </div>
     </div>`;
   initMatSortable(room.id);
-
-  // Auto-resize all textareas after render
   el.querySelectorAll('textarea').forEach(autoResize);
 }
 
@@ -400,16 +422,125 @@ function initMatSortable(roomId) {
     onEnd: (evt) => {
       const room = getRoom(roomId);
       if (!room) return;
-      const moved = room.materials.splice(evt.oldIndex, 1)[0];
-      room.materials.splice(evt.newIndex, 0, moved);
+      const liveMats = room.materials.filter(m => !m.deleted);
+      const [moved] = liveMats.splice(evt.oldIndex, 1);
+      liveMats.splice(evt.newIndex, 0, moved);
+      let liveIdx = 0;
+      room.materials = room.materials.map(m => m.deleted ? m : liveMats[liveIdx++]);
       save(true);
-      render(false); // Update indices and UI
+      render(false);
     }
   });
 }
 
 // ---------------------------------------------------------------------------
-// Actions — exposed to inline handlers via window.*
+// Trash modal
+// ---------------------------------------------------------------------------
+
+window.openTrash = function(roomId) {
+  // If roomId given: show deleted materials + images for that room.
+  // If no roomId: show all deleted rooms.
+  const buildBody = () => {
+    let html = '';
+
+    if (roomId) {
+      const room = getRoom(roomId);
+      if (!room) return '<p style="color:#aaa">Brak usuniętych elementów.</p>';
+
+      const deletedMats = room.materials.filter(m => m.deleted);
+      const deletedImgs = room.images.filter(img => img.deleted);
+
+      if (deletedMats.length) {
+        html += `<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Materiały</div>`;
+        html += deletedMats.map(m => `
+          <div class="trash-row">
+            <span style="flex:1;font-size:13px">${escHtml(m.name)}</span>
+            <button class="btn" style="font-size:12px;padding:4px 10px" onclick="restoreMat('${roomId}','${m.id}')">Przywróć</button>
+          </div>`).join('');
+      }
+
+      if (deletedImgs.length) {
+        html += `<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin:12px 0 8px">Zdjęcia</div>`;
+        html += `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px">`;
+        html += deletedImgs.map(img => {
+          const src = escHtml(img.url || img.data || '');
+          return `<div style="position:relative;width:80px;height:60px;border-radius:6px;overflow:hidden;border:0.5px solid #ddd">
+            <img src="${src}" style="width:100%;height:100%;object-fit:cover;opacity:0.5">
+            <button class="btn" style="position:absolute;bottom:2px;right:2px;font-size:10px;padding:2px 6px" onclick="restoreImg('${roomId}','${img.id}')">↩</button>
+          </div>`;
+        }).join('');
+        html += '</div>';
+      }
+
+      if (!deletedMats.length && !deletedImgs.length) {
+        html = '<p style="color:#aaa;font-size:13px">Kosz jest pusty.</p>';
+      }
+    } else {
+      // Global trash — deleted rooms
+      const deletedRooms = state.rooms.filter(r => r.deleted);
+      if (deletedRooms.length) {
+        html += `<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">Pomieszczenia</div>`;
+        html += deletedRooms.map(r => `
+          <div class="trash-row">
+            <span style="flex:1;font-size:13px">${escHtml(r.name)}</span>
+            <button class="btn" style="font-size:12px;padding:4px 10px" onclick="restoreRoom('${r.id}')">Przywróć</button>
+          </div>`).join('');
+      }
+
+      // Also show rooms that have deleted content
+      const roomsWithDeletedContent = state.rooms.filter(r =>
+        !r.deleted && (r.materials.some(m => m.deleted) || r.images.some(img => img.deleted))
+      );
+      if (roomsWithDeletedContent.length) {
+        html += `<div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.06em;margin:12px 0 8px">Usunięte elementy w pomieszczeniach</div>`;
+        html += roomsWithDeletedContent.map(r => {
+          const dc = r.materials.filter(m => m.deleted).length + r.images.filter(img => img.deleted).length;
+          return `<div class="trash-row">
+            <span style="flex:1;font-size:13px">${escHtml(r.name)} <span style="color:#aaa">(${dc})</span></span>
+            <button class="btn" style="font-size:12px;padding:4px 10px" onclick="closeModal();openTrash('${r.id}')">Pokaż</button>
+          </div>`;
+        }).join('');
+      }
+
+      if (!deletedRooms.length && !roomsWithDeletedContent.length) {
+        html = '<p style="color:#aaa;font-size:13px">Kosz jest pusty.</p>';
+      }
+    }
+    return html;
+  };
+
+  showModal('Kosz', buildBody, null, false);
+};
+
+window.restoreRoom = function(id) {
+  const r = getRoom(id);
+  if (!r) return;
+  r.deleted = false;
+  if (!state.activeRoom) state.activeRoom = id;
+  closeModal();
+  render();
+};
+
+window.restoreMat = function(roomId, matId) {
+  const m = findMat(roomId, matId);
+  if (!m) return;
+  m.deleted = false;
+  closeModal();
+  render();
+};
+
+window.restoreImg = function(roomId, imgId) {
+  const r = getRoom(roomId);
+  if (!r) return;
+  const img = r.images.find(i => i.id === imgId);
+  if (!img) return;
+  img.deleted = false;
+  closeModal();
+  render();
+};
+
+// ---------------------------------------------------------------------------
+// Actions
 // ---------------------------------------------------------------------------
 
 function escHtml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
@@ -422,7 +553,7 @@ function formatPrice(val) {
 window.selectRoom = function(id) {
   if (state.activeRoom === id) return;
   state.activeRoom = id;
-  render(false); // No need to push state just because we changed local tab
+  render(false);
   window.toggleSidebar(false);
 };
 
@@ -444,7 +575,6 @@ window.renameRoomNotes = function(id, notes) {
   const r = getRoom(id); if (r) { r.notes = notes; save(true); }
 };
 
-// Called on every oninput keystroke — writes to state immediately and debounces the Firestore save.
 window.updateRoomNotes = function(id, notes) {
   const r = getRoom(id); if (!r) return;
   r.notes = notes;
@@ -459,13 +589,22 @@ window.updateMatField = function(roomId, matId, field, val) {
 
 window.addRoom = function() {
   showModal('Nowe pomieszczenie', () => `<input id="modal-input" placeholder="Nazwa pomieszczenia..." onkeydown="if(event.key==='Enter')modalConfirm()">`,
-    val => { if (!val || !val.trim()) return; const r = { id: uid(), name: val.trim(), images: [], materials: [] }; state.rooms.push(r); state.activeRoom = r.id; render(); });
+    val => {
+      if (!val || !val.trim()) return;
+      const r = { id: uid(), name: val.trim(), images: [], materials: [], notes: '', deleted: false };
+      state.rooms.push(r);
+      state.activeRoom = r.id;
+      render();
+    });
 };
 
 window.deleteRoom = function(id) {
-  if (!confirm('Usunąć to pomieszczenie wraz z całą jego zawartością?')) return;
-  state.rooms = state.rooms.filter(r => r.id !== id);
-  state.activeRoom = state.rooms.length ? state.rooms[0].id : null;
+  if (!confirm('Przenieść to pomieszczenie do kosza?')) return;
+  const r = getRoom(id);
+  if (!r) return;
+  r.deleted = true;
+  const liveRooms = state.rooms.filter(r => !r.deleted);
+  state.activeRoom = liveRooms.length ? liveRooms[0].id : null;
   render();
 };
 
@@ -480,7 +619,7 @@ window.addMat = function(roomId) {
   const priceFinalRaw = document.getElementById('in-price-final').value;
   const priceEst = priceEstRaw !== '' ? parseFloat(priceEstRaw) : null;
   const priceFinal = priceFinalRaw !== '' ? parseFloat(priceFinalRaw) : null;
-  getRoom(roomId).materials.push({ id: uid(), name, qty, unit, link, done: false, notes: '', priceEst, priceFinal });
+  getRoom(roomId).materials.push({ id: uid(), name, qty, unit, link, done: false, notes: '', priceEst, priceFinal, deleted: false });
   render(true);
   document.getElementById('in-name')?.focus();
 };
@@ -502,18 +641,13 @@ window.editMat = function(roomId, matId, field, val) {
   } else {
     m[field] = val.trim();
   }
-  // Save without re-rendering — the user just blurred, the DOM already reflects
-  // what they typed. A full render here would rebuild the DOM mid-interaction.
   save(true);
 };
 
 window.delMat = function(roomId, matId) {
-  const r = getRoom(roomId);
-  if (!r) return;
-  const m = r.materials.find(mat => mat.id === matId);
+  const m = findMat(roomId, matId);
   if (!m) return;
-  if (!confirm(`Czy na pewno chcesz usunąć materiał: "${m.name}"?`)) return;
-  r.materials = r.materials.filter(mat => mat.id !== matId);
+  m.deleted = true;
   render();
 };
 
@@ -525,7 +659,7 @@ window.addImages = function(roomId, evt) {
     [...evt.target.files].forEach(f => {
       const fr = new FileReader();
       fr.onload = e => {
-        r.images.push({ id: uid(), data: e.target.result, name: f.name });
+        r.images.push({ id: uid(), data: e.target.result, name: f.name, deleted: false });
         render();
       };
       fr.readAsDataURL(f);
@@ -537,11 +671,6 @@ window.addImages = function(roomId, evt) {
   if (!files.length) return;
 
   setBanner("sync", `Przesyłanie ${files.length} zdjęć…`);
-  console.log(`[Storage] Starting upload of ${files.length} files for room ${roomId}`);
-
-  // Collect results in a local array — never touch state.rooms inside the async callbacks.
-  // This prevents a Firestore snapshot that fires between two awaits from causing
-  // some images to be pushed to a detached (replaced) room object and lost.
   const newImages = [];
   let failCount = 0;
 
@@ -549,14 +678,10 @@ window.addImages = function(roomId, evt) {
     const fileId = uid();
     const path = `rooms/${roomId}/${fileId}_${f.name}`;
     const storageRef = ref(storage, path);
-
     try {
-      console.log(`[Storage] Uploading ${f.name} to ${path}...`);
       const snap = await uploadBytes(storageRef, f);
-      console.log(`[Storage] Upload successful for ${f.name}`);
       const url = await getDownloadURL(snap.ref);
-      console.log(`[Storage] URL obtained: ${url}`);
-      newImages.push({ id: uid(), url, path, name: f.name });
+      newImages.push({ id: uid(), url, path, name: f.name, deleted: false });
     } catch (err) {
       console.error(`[Storage] Error during upload of ${f.name}:`, err.code, err.message);
       failCount++;
@@ -566,40 +691,26 @@ window.addImages = function(roomId, evt) {
 
   Promise.all(uploads).then(() => {
     if (newImages.length > 0) {
-      // Get a single fresh room reference after all uploads are done and apply atomically.
       const r = getRoom(roomId);
       if (r) {
-        console.log(`[Storage] Pushing ${newImages.length} images to room atomically`);
         r.images.push(...newImages);
         setBanner("sync", failCount > 0 ? `Przesłano ${newImages.length}, błąd ${failCount}` : "Zdjęcia przesłane", 3000);
         render(true);
       } else {
-        console.error(`[Storage] Room ${roomId} not found — files uploaded to Storage but not linked`);
         setBanner("error", "Pokój nie istnieje — zdjęcia przesłane do Storage, ale nie zapisane");
       }
     } else if (failCount > 0) {
-      console.error(`[Storage] All uploads failed`);
       setBanner("error", "Nie udało się przesłać zdjęć");
     }
   });
 };
 
 window.delImg = function(roomId, imgId) {
-  if (!confirm('Czy na pewno chcesz usunąć to zdjęcie?')) return;
   const r = getRoom(roomId);
   if (!r) return;
-  const idx = r.images.findIndex(img => img.id === imgId);
-  if (idx === -1) return;
-  const img = r.images[idx];
-
-  if (img.path && storage) {
-    const storageRef = ref(storage, img.path);
-    deleteObject(storageRef).catch(err => {
-      console.warn("Could not delete file from storage:", err);
-    });
-  }
-
-  r.images.splice(idx, 1);
+  const img = r.images.find(i => i.id === imgId);
+  if (!img) return;
+  img.deleted = true;
   render(true);
 };
 
