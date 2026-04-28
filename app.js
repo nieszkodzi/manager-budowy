@@ -308,8 +308,10 @@ function renderContent() {
 
   const imgGrid = liveImages.map(img => {
     const src = escHtml(img.url || img.data || '');
-    return `<div class="img-thumb" onclick="openImage('${src}')">
-      <img src="${src}" alt="wizualizacja">
+    const cap = img.description ? escHtml(img.description) : '';
+    return `<div class="img-thumb" onclick="openImage('${src}','${room.id}','${img.id}')">
+      <div class="img-thumb-photo"><img src="${src}" alt="wizualizacja"></div>
+      <div class="img-thumb-caption ${cap ? '' : 'empty'}">${cap || 'dodaj opis...'}</div>
       <button class="img-del" onclick="event.stopPropagation();delImg('${room.id}','${img.id}')">✕</button>
     </div>`;
   }).join('');
@@ -365,10 +367,7 @@ function renderContent() {
         ${total ? `<span class="progress-badge">${done}/${total} kupione</span>` : ''}
       </div>
       <div class="room-actions">
-        <label class="btn" style="cursor:pointer;font-size:13px">+ Dodaj zdjęcie
-          <input type="file" accept="image/*" multiple onchange="addImages('${room.id}',event)">
-        </label>
-        ${trashCount ? `<button class="btn" style="color:#aaa;font-size:13px" onclick="openTrash('${room.id}')">🗑 Kosz (${trashCount})</button>` : ''}
+${trashCount ? `<button class="btn" style="color:#aaa;font-size:13px" onclick="openTrash('${room.id}')">🗑 Kosz (${trashCount})</button>` : ''}
         <button class="btn danger" onclick="deleteRoom('${room.id}')">Usuń pomieszczenie</button>
       </div>
     </div>
@@ -386,7 +385,15 @@ function renderContent() {
       ${estTotal > 0 ? `<div class="sum-card"><div class="sum-label">Szacunkowy koszt</div><div class="sum-val" style="font-size:1rem">${formatPrice(estTotal)}</div></div>` : ''}
       ${finalTotal > 0 ? `<div class="sum-card"><div class="sum-label">Koszt końcowy</div><div class="sum-val" style="font-size:1rem;color:#3B6D11">${formatPrice(finalTotal)}</div></div>` : ''}
     </div>
-    ${liveImages.length ? `<div class="img-section"><div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div></div>` : ''}
+    <div class="img-section">
+      ${liveImages.length ? `<div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div>` : ''}
+      <div class="img-drop-zone" id="img-drop-zone-${room.id}"
+        ondragover="event.preventDefault();this.classList.add('drag-over')"
+        ondragleave="this.classList.remove('drag-over')"
+        ondrop="handleImgDrop('${room.id}',event)">
+        Przeciągnij zdjęcia tutaj lub <label style="color:#888;cursor:pointer;text-decoration:underline">wybierz z dysku<input type="file" accept="image/*" multiple style="display:none" onchange="addImages('${room.id}',event)"></label>
+      </div>
+    </div>
     <div class="materials-section">
       <div class="mat-header">
         <div style="width:24px"></div>
@@ -727,12 +734,44 @@ window.delImg = function(roomId, imgId) {
   render(true);
 };
 
-window.openImage = function(url) {
+window.openImage = function(url, roomId, imgId) {
+  const img = findImgObj(roomId, imgId);
   const overlay = document.createElement('div');
   overlay.className = 'img-overlay';
-  overlay.innerHTML = `<img src="${url}" alt="enlarged">`;
-  overlay.onclick = () => document.body.removeChild(overlay);
+  overlay.innerHTML = `
+    <img src="${url}" alt="enlarged">
+    <div class="img-overlay-footer">
+      <textarea class="img-overlay-desc" placeholder="Opis zdjęcia (opcjonalnie)...">${img ? escHtml(img.description || '') : ''}</textarea>
+      <span class="img-overlay-hint">Kliknij zdjęcie lub naciśnij Esc, żeby zamknąć</span>
+    </div>`;
+  const close = () => {
+    const desc = overlay.querySelector('.img-overlay-desc').value;
+    if (img && desc !== (img.description || '')) {
+      img.description = desc;
+      save(true);
+      render(false);
+    }
+    document.body.removeChild(overlay);
+  };
+  overlay.querySelector('img').onclick = close;
+  overlay.querySelector('.img-overlay-desc').onclick = e => e.stopPropagation();
+  overlay.onkeydown = e => { if (e.key === 'Escape') close(); };
   document.body.appendChild(overlay);
+  overlay.querySelector('.img-overlay-desc').focus();
+};
+
+function findImgObj(roomId, imgId) {
+  return getRoom(roomId)?.images.find(i => i.id === imgId);
+}
+
+window.handleImgDrop = function(roomId, evt) {
+  evt.preventDefault();
+  const zone = document.getElementById(`img-drop-zone-${roomId}`);
+  if (zone) zone.classList.remove('drag-over');
+  const files = [...(evt.dataTransfer.files || [])].filter(f => f.type.startsWith('image/'));
+  if (!files.length) return;
+  const fakeEvt = { target: { files } };
+  window.addImages(roomId, fakeEvt);
 };
 
 window.exportJSON = function() {
