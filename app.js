@@ -243,7 +243,9 @@ function renderContent() {
   const el = document.getElementById('content');
   const room = getRoom(activeRoomId);
   if (!room || room.deleted) { el.innerHTML = '<div class="empty-state">Wybierz pomieszczenie</div>'; return; }
-  if (isEditing && document.activeElement && el.contains(document.activeElement)) return;
+  const focused = document.activeElement;
+  const inMatRow = focused && el.contains(focused) && focused.closest('.mat-row, .room-notes-section, .room-title');
+  if (isEditing && inMatRow) return;
 
   const mats  = liveMats(room.id);
   const imgs  = livePhotos(room.id);
