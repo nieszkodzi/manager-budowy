@@ -19,6 +19,7 @@ if (window.FIREBASE_CONFIG) {
 let db = null;
 let storage = null;
 let unsubscribe = null;
+let pendingSaveCount = 0; // number of setDoc calls not yet acknowledged by Firestore
 
 if (firebaseReady) {
   try {
@@ -86,10 +87,14 @@ function stateForStorage() {
 function save(pushToFirestore = true) {
   localStorage.setItem(LOCAL_KEY, JSON.stringify(state));
   if (db && pushToFirestore) {
-    setDoc(doc(db, FIRESTORE_DOC), stateForStorage()).catch(err => {
-      console.error("Firestore write failed:", err);
-      setBanner("error", "Błąd zapisu: " + (err.code || err.message));
-    });
+    pendingSaveCount++;
+    setDoc(doc(db, FIRESTORE_DOC), stateForStorage())
+      .then(() => { pendingSaveCount = Math.max(0, pendingSaveCount - 1); })
+      .catch(err => {
+        pendingSaveCount = Math.max(0, pendingSaveCount - 1);
+        console.error("Firestore write failed:", err);
+        setBanner("error", "Błąd zapisu: " + (err.code || err.message));
+      });
   }
 }
 
@@ -117,8 +122,13 @@ function init() {
         return;
       }
 
-      // Don't overwrite state while the user is actively editing a field.
-      // The next snapshot after their blur+save will carry their changes.
+      // Block incoming remote state while we have saves in-flight or the user
+      // is actively typing. The confirmed snapshot from our own write will
+      // arrive once Firestore acknowledges it, carrying our latest data.
+      if (pendingSaveCount > 0) {
+        console.log("[Firestore] save in flight, skipping remote update");
+        return;
+      }
       if (isEditing) {
         console.log("[Firestore] user is editing, deferring remote update");
         return;
@@ -440,7 +450,9 @@ window.editMat = function(roomId, matId, field, val) {
   const m = findMat(roomId, matId);
   if (!m) return;
   m[field] = field === 'qty' ? (parseFloat(val) || 0) : val.trim();
-  render(true);
+  // Save without re-rendering — the user just blurred, the DOM already reflects
+  // what they typed. A full render here would rebuild the DOM mid-interaction.
+  save(true);
 };
 
 window.delMat = function(roomId, matId) {
