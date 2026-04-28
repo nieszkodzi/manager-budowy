@@ -27,6 +27,13 @@ function debouncedSave() {
   saveDebounceTimer = setTimeout(() => save(true), 600);
 }
 
+// Cancel any pending debounce and save immediately — called on textarea blur
+// so notes are in Firestore (pendingSaveCount > 0) before any snapshot can arrive.
+window.flushSave = function() {
+  clearTimeout(saveDebounceTimer);
+  save(true);
+};
+
 if (firebaseReady) {
   try {
     const app = initializeApp(cfg);
@@ -310,7 +317,9 @@ function renderContent() {
       <div class="mat-name-cell">
         <div class="mat-name" contenteditable="true" onfocus="setEditing(true)" onblur="setEditing(false);editMat('${room.id}','${m.id}','name',this.innerText)">${escHtml(m.name)}</div>
         <textarea class="mat-notes" placeholder="Notatki..."
-          oninput="autoResize(this);updateMatField('${room.id}','${m.id}','notes',this.value)">${escHtml(m.notes || '')}</textarea>
+          onfocus="setEditing(true)"
+          oninput="autoResize(this);updateMatField('${room.id}','${m.id}','notes',this.value)"
+          onblur="setEditing(false);flushSave()">${escHtml(m.notes || '')}</textarea>
       </div>
       <div class="mat-qty">
         <input type="number" value="${m.qty}" min="0" step="0.1"
@@ -361,7 +370,9 @@ function renderContent() {
     </div>
     <div class="room-notes-section">
       <textarea class="room-notes" placeholder="Notatki do pomieszczenia..."
-        oninput="autoResize(this);updateRoomNotes('${room.id}',this.value)">${escHtml(room.notes || '')}</textarea>
+        onfocus="setEditing(true)"
+        oninput="autoResize(this);updateRoomNotes('${room.id}',this.value)"
+        onblur="setEditing(false);flushSave()">${escHtml(room.notes || '')}</textarea>
     </div>
     <div class="summary-bar">
       <div class="sum-card"><div class="sum-label">Wszystkich pozycji</div><div class="sum-val">${total}</div></div>
