@@ -277,13 +277,17 @@ function initRoomSortable() {
 }
 
 let isEditing = false;
+window.setEditing = function(val) { isEditing = val; };
 function setEditing(val) { isEditing = val; }
 
-function autoResize(el) {
+window.autoResize = function(el) {
   if (!el) return;
   el.style.height = 'auto';
   el.style.height = el.scrollHeight + 'px';
-}
+};
+function autoResize(el) { window.autoResize(el); }
+
+window.save = save;
 
 function renderContent() {
   const el = document.getElementById('content');
