@@ -338,11 +338,12 @@ function renderContent() {
     </div>
     <div class="img-section">
       ${imgs.length ? `<div class="img-label">Wizualizacje / inspiracje</div><div class="img-grid">${imgGrid}</div>` : ''}
-      <div class="img-drop-zone" id="img-drop-zone-${room.id}"
+      <div class="img-drop-zone" id="img-drop-zone-${room.id}" tabindex="0"
         ondragover="event.preventDefault();this.classList.add('drag-over')"
         ondragleave="this.classList.remove('drag-over')"
-        ondrop="handleImgDrop('${room.id}',event)">
-        Przeciągnij zdjęcia tutaj lub <label style="color:#888;cursor:pointer;text-decoration:underline">wybierz z dysku<input type="file" accept="image/*" multiple style="display:none" onchange="addImages('${room.id}',event)"></label>
+        ondrop="handleImgDrop('${room.id}',event)"
+        onpaste="handleImgPaste('${room.id}',event)">
+        Przeciągnij zdjęcia tutaj, <label style="color:#888;cursor:pointer;text-decoration:underline">wybierz z dysku<input type="file" accept="image/*" multiple style="display:none" onchange="addImages('${room.id}',event)"></label> lub wklej ze schowka (Ctrl+V)
       </div>
     </div>
     <div class="materials-section">
@@ -722,6 +723,15 @@ window.handleImgDrop = function(roomId, evt) {
   document.getElementById(`img-drop-zone-${roomId}`)?.classList.remove('drag-over');
   const files = [...(evt.dataTransfer.files || [])].filter(f => f.type.startsWith('image/'));
   if (files.length) window.addImages(roomId, { target: { files } });
+};
+
+window.handleImgPaste = function(roomId, evt) {
+  const files = [...(evt.clipboardData?.items || [])]
+    .filter(i => i.kind === 'file' && i.type.startsWith('image/'))
+    .map(i => i.getAsFile());
+  if (!files.length) return;
+  evt.preventDefault();
+  window.addImages(roomId, { target: { files } });
 };
 
 // ---------------------------------------------------------------------------
